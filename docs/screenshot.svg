@@ -1,0 +1,181 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1544" height="320" viewBox="0 0 1544 320">
+<rect width="1544" height="320" rx="8" fill="#1e1e2e"/>
+<g font-family="JetBrains Mono, Menlo, Consolas, monospace" font-size="14">
+<text x="16.0" y="29" fill="#5f5f5f">╭─────────────────────────────────────────────────────────────────────────────────</text>
+<text x="713.2" y="29" fill="#afafaf">Claude</text>
+<text x="772.0" y="29" fill="#afafaf">reports</text>
+<text x="839.2" y="29" fill="#5f5f5f">─────────────────────────────────────────────────────────────────────────────────╮</text>
+<text x="16.0" y="47" fill="#cdd6f4">│</text>
+<text x="49.6" y="47" fill="#87afaf">Enter</text>
+<text x="100.0" y="47" fill="#87afaf">open</text>
+<text x="142.0" y="47" fill="#87afaf">·</text>
+<text x="158.8" y="47" fill="#87afaf">c</text>
+<text x="175.6" y="47" fill="#87afaf">go</text>
+<text x="200.8" y="47" fill="#87afaf">to</text>
+<text x="226.0" y="47" fill="#87afaf">session</text>
+<text x="293.2" y="47" fill="#87afaf">·</text>
+<text x="310.0" y="47" fill="#87afaf">dd</text>
+<text x="335.2" y="47" fill="#87afaf">delete</text>
+<text x="394.0" y="47" fill="#87afaf">·</text>
+<text x="410.8" y="47" fill="#87afaf">?</text>
+<text x="427.6" y="47" fill="#87afaf">more</text>
+<text x="772.0" y="47" fill="#5f5f5f">╭──────────────────────────────────────────────────────────────────────────────────────╮</text>
+<text x="1519.6" y="47" fill="#5f5f5f">│</text>
+<text x="16.0" y="65" fill="#cdd6f4">│</text>
+<rect x="32.8" y="52" width="8.4" height="18" fill="#303030"/>
+<text x="32.8" y="65" fill="#d7005f" font-weight="bold">▌</text>
+<rect x="41.2" y="52" width="8.4" height="18" fill="#303030"/>
+<rect x="49.6" y="52" width="8.4" height="18" fill="#303030"/>
+<text x="49.6" y="65" fill="#a6e3a1" font-weight="bold">●</text>
+<rect x="58.0" y="52" width="344.4" height="18" fill="#303030"/>
+<text x="66.4" y="65" fill="#e4e4e4" font-weight="bold">Add</text>
+<text x="100.0" y="65" fill="#e4e4e4" font-weight="bold">rate</text>
+<text x="142.0" y="65" fill="#e4e4e4" font-weight="bold">limiting</text>
+<text x="217.6" y="65" fill="#e4e4e4" font-weight="bold">to</text>
+<text x="242.8" y="65" fill="#e4e4e4" font-weight="bold">/login</text>
+<rect x="402.4" y="52" width="168.0" height="18" fill="#303030"/>
+<text x="402.4" y="65" fill="#94e2d5" font-weight="bold">▶</text>
+<text x="419.2" y="65" fill="#94e2d5" font-weight="bold">api:1.1</text>
+<rect x="570.4" y="52" width="8.4" height="18" fill="#303030"/>
+<rect x="578.8" y="52" width="159.6" height="18" fill="#303030"/>
+<text x="578.8" y="65" fill="#7f849c" font-weight="bold">api</text>
+<text x="713.2" y="65" fill="#7f849c" font-weight="bold">41s</text>
+<text x="772.0" y="65" fill="#5f5f5f">│</text>
+<text x="788.8" y="65" fill="#f38ba8">#</text>
+<text x="805.6" y="65" fill="#f38ba8">Add</text>
+<text x="839.2" y="65" fill="#f38ba8">rate</text>
+<text x="881.2" y="65" fill="#f38ba8">limiting</text>
+<text x="956.8" y="65" fill="#f38ba8">to</text>
+<text x="982.0" y="65" fill="#f38ba8">/login</text>
+<text x="1460.8" y="65" fill="#afaf87">1/38</text>
+<text x="1494.4" y="65" fill="#5f5f5f">││</text>
+<text x="1519.6" y="65" fill="#5f5f5f">│</text>
+<text x="16.0" y="83" fill="#cdd6f4">│</text>
+<text x="49.6" y="83" fill="#a6e3a1">●</text>
+<text x="66.4" y="83" fill="#cdd6f4">Fix</text>
+<text x="100.0" y="83" fill="#cdd6f4">flaky</text>
+<text x="150.4" y="83" fill="#cdd6f4">checkout</text>
+<text x="226.0" y="83" fill="#cdd6f4">e2e</text>
+<text x="259.6" y="83" fill="#cdd6f4">test</text>
+<text x="419.2" y="83" fill="#7f849c">closed</text>
+<text x="578.8" y="83" fill="#7f849c">webshop</text>
+<text x="721.6" y="83" fill="#7f849c">5m</text>
+<text x="772.0" y="83" fill="#5f5f5f">│</text>
+<text x="1494.4" y="83" fill="#5f5f5f">││</text>
+<text x="1519.6" y="83" fill="#5f5f5f">│</text>
+<text x="16.0" y="101" fill="#cdd6f4">│</text>
+<text x="49.6" y="101" fill="#7f849c">○</text>
+<text x="66.4" y="101" fill="#cdd6f4">Migrate</text>
+<text x="133.6" y="101" fill="#cdd6f4">nvim</text>
+<text x="175.6" y="101" fill="#cdd6f4">config</text>
+<text x="234.4" y="101" fill="#cdd6f4">to</text>
+<text x="259.6" y="101" fill="#cdd6f4">lazy.nvim</text>
+<text x="402.4" y="101" fill="#94e2d5">▶</text>
+<text x="419.2" y="101" fill="#94e2d5">dotfiles:1.1</text>
+<text x="578.8" y="101" fill="#7f849c">dotfiles</text>
+<text x="721.6" y="101" fill="#7f849c">1h</text>
+<text x="772.0" y="101" fill="#5f5f5f">│</text>
+<text x="788.8" y="101" fill="#5f5f5f">|</text>
+<text x="805.6" y="101" fill="#5f5f5f">|</text>
+<text x="822.4" y="101" fill="#5f5f5f">|</text>
+<text x="1494.4" y="101" fill="#5f5f5f">││</text>
+<text x="1519.6" y="101" fill="#5f5f5f">│</text>
+<text x="16.0" y="119" fill="#cdd6f4">│</text>
+<text x="49.6" y="119" fill="#7f849c">○</text>
+<text x="66.4" y="119" fill="#cdd6f4">Draft</text>
+<text x="116.8" y="119" fill="#cdd6f4">post</text>
+<text x="158.8" y="119" fill="#cdd6f4">on</text>
+<text x="184.0" y="119" fill="#cdd6f4">tmux</text>
+<text x="226.0" y="119" fill="#cdd6f4">workflows</text>
+<text x="419.2" y="119" fill="#7f849c">closed</text>
+<text x="578.8" y="119" fill="#7f849c">blog</text>
+<text x="721.6" y="119" fill="#7f849c">2h</text>
+<text x="772.0" y="119" fill="#5f5f5f">│</text>
+<text x="788.8" y="119" fill="#5f5f5f">|---|---|</text>
+<text x="1502.8" y="119" fill="#5f5f5f">│</text>
+<text x="1519.6" y="119" fill="#5f5f5f">│</text>
+<text x="16.0" y="137" fill="#cdd6f4">│</text>
+<text x="49.6" y="137" fill="#7f849c">○</text>
+<text x="66.4" y="137" fill="#cdd6f4">Summarize</text>
+<text x="150.4" y="137" fill="#cdd6f4">related</text>
+<text x="217.6" y="137" fill="#cdd6f4">work</text>
+<text x="259.6" y="137" fill="#cdd6f4">chapter</text>
+<text x="419.2" y="137" fill="#7f849c">closed</text>
+<text x="578.8" y="137" fill="#7f849c">thesis</text>
+<text x="721.6" y="137" fill="#7f849c">1d</text>
+<text x="772.0" y="137" fill="#5f5f5f">│</text>
+<text x="788.8" y="137" fill="#5f5f5f">|</text>
+<text x="805.6" y="137" fill="#5f5f5f" font-weight="bold">**tmux**</text>
+<text x="881.2" y="137" fill="#cdd6f4">|</text>
+<text x="898.0" y="137" fill="#cdd6f4">`api:1.1`</text>
+<text x="982.0" y="137" fill="#cdd6f4">|</text>
+<text x="1502.8" y="137" fill="#5f5f5f">│</text>
+<text x="1519.6" y="137" fill="#5f5f5f">│</text>
+<text x="16.0" y="155" fill="#cdd6f4">│</text>
+<text x="772.0" y="155" fill="#5f5f5f">│</text>
+<text x="788.8" y="155" fill="#5f5f5f">|</text>
+<text x="805.6" y="155" fill="#5f5f5f" font-weight="bold">**Folder**</text>
+<text x="898.0" y="155" fill="#cdd6f4">|</text>
+<text x="914.8" y="155" fill="#cdd6f4">`/home/you/code/api`</text>
+<text x="1091.2" y="155" fill="#cdd6f4">|</text>
+<text x="1502.8" y="155" fill="#5f5f5f">│</text>
+<text x="1519.6" y="155" fill="#5f5f5f">│</text>
+<text x="16.0" y="173" fill="#cdd6f4">│</text>
+<text x="772.0" y="173" fill="#5f5f5f">│</text>
+<text x="788.8" y="173" fill="#5f5f5f">|</text>
+<text x="805.6" y="173" fill="#5f5f5f" font-weight="bold">**Branch**</text>
+<text x="898.0" y="173" fill="#cdd6f4">|</text>
+<text x="914.8" y="173" fill="#cdd6f4">`main`</text>
+<text x="973.6" y="173" fill="#cdd6f4">|</text>
+<text x="1502.8" y="173" fill="#5f5f5f">│</text>
+<text x="1519.6" y="173" fill="#5f5f5f">│</text>
+<text x="16.0" y="191" fill="#cdd6f4">│</text>
+<text x="772.0" y="191" fill="#5f5f5f">│</text>
+<text x="788.8" y="191" fill="#5f5f5f">|</text>
+<text x="805.6" y="191" fill="#5f5f5f" font-weight="bold">**Finished**</text>
+<text x="914.8" y="191" fill="#cdd6f4">|</text>
+<text x="931.6" y="191" fill="#cdd6f4">2026-11-20</text>
+<text x="1024.0" y="191" fill="#cdd6f4">16:35</text>
+<text x="1074.4" y="191" fill="#cdd6f4">|</text>
+<text x="1502.8" y="191" fill="#5f5f5f">│</text>
+<text x="1519.6" y="191" fill="#5f5f5f">│</text>
+<text x="16.0" y="209" fill="#cdd6f4">│</text>
+<text x="772.0" y="209" fill="#5f5f5f">│</text>
+<text x="788.8" y="209" fill="#5f5f5f">|</text>
+<text x="805.6" y="209" fill="#5f5f5f" font-weight="bold">**Session**</text>
+<text x="906.4" y="209" fill="#cdd6f4">|</text>
+<text x="923.2" y="209" fill="#cdd6f4">started</text>
+<text x="990.4" y="209" fill="#cdd6f4">2026-11-20</text>
+<text x="1082.8" y="209" fill="#cdd6f4">16:10</text>
+<text x="1133.2" y="209" fill="#cdd6f4">(25</text>
+<text x="1166.8" y="209" fill="#cdd6f4">min),</text>
+<text x="1217.2" y="209" fill="#cdd6f4">prompt</text>
+<text x="1276.0" y="209" fill="#cdd6f4">2</text>
+<text x="1292.8" y="209" fill="#cdd6f4">|</text>
+<text x="1502.8" y="209" fill="#5f5f5f">│</text>
+<text x="1519.6" y="209" fill="#5f5f5f">│</text>
+<text x="16.0" y="227" fill="#cdd6f4">│</text>
+<text x="772.0" y="227" fill="#5f5f5f">│</text>
+<text x="788.8" y="227" fill="#5f5f5f">|</text>
+<text x="805.6" y="227" fill="#5f5f5f" font-weight="bold">**Id**</text>
+<text x="864.4" y="227" fill="#cdd6f4">|</text>
+<text x="881.2" y="227" fill="#cdd6f4">`00000001-0000-4000-8000-000000000001`</text>
+<text x="1208.8" y="227" fill="#cdd6f4">|</text>
+<text x="1502.8" y="227" fill="#5f5f5f">│</text>
+<text x="1519.6" y="227" fill="#5f5f5f">│</text>
+<text x="16.0" y="245" fill="#cdd6f4">│</text>
+<text x="772.0" y="245" fill="#5f5f5f">│</text>
+<text x="1502.8" y="245" fill="#5f5f5f">│</text>
+<text x="1519.6" y="245" fill="#5f5f5f">│</text>
+<text x="16.0" y="263" fill="#cdd6f4">│</text>
+<text x="772.0" y="263" fill="#5f5f5f">│</text>
+<text x="788.8" y="263" fill="#f38ba8">##</text>
+<text x="814.0" y="263" fill="#f38ba8">Asked</text>
+<text x="1502.8" y="263" fill="#5f5f5f">│</text>
+<text x="1519.6" y="263" fill="#5f5f5f">│</text>
+<text x="16.0" y="281" fill="#cdd6f4">│</text>
+<text x="772.0" y="281" fill="#5f5f5f">╰──────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="1519.6" y="281" fill="#5f5f5f">│</text>
+<text x="16.0" y="299" fill="#cdd6f4">╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+</g>
+</svg>

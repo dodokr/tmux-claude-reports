@@ -1,0 +1,1218 @@
+#!/usr/bin/env python3
+"""A report each time Claude finishes a reply: read it in a tmux popup or in the browser.
+
+    claude-reports              open the picker (meant for: tmux display-popup -E)
+    claude-reports hook         Stop hook: write the report (hook JSON on stdin)
+    claude-reports list         print reports, newest unread first (used by the picker)
+    claude-reports show ID      print a report's markdown
+    claude-reports open ID      open a report in the browser (served by `serve`, with buttons:
+                                go to pane, mark read, kill session)
+    claude-reports resume ID    go to the session: jump to its pane, or resume it in tmux
+    claude-reports toggle ID    mark read / unread
+    claude-reports delete ID    delete a report
+    claude-reports serve        the HTTP server behind the browser pages (127.0.0.1 only;
+                                started on demand, exits when idle)
+    claude-reports read-all     mark every report read
+    claude-reports count [--tmux]
+                                number of unread reports; --tmux prints a status-line segment
+                                (nothing when there are none)
+
+One report per session, rewritten after every reply: your latest prompt, Claude's final
+reply to it, the files it changed on the way, and your earlier prompts. A reply counts as
+read when it arrives in the pane you are looking at (tmux focus events). Stored as
+<session id>.md and .json in $CLAUDE_REPORTS_DIR (default $XDG_STATE_HOME/claude-reports),
+pruned after $CLAUDE_REPORTS_KEEP_DAYS days (default 14).
+
+$CLAUDE_REPORTS_PORT      server port (default 47823)
+$CLAUDE_REPORTS_IDLE      seconds without requests before the server exits (default 1800)
+$CLAUDE_REPORTS_BROWSER   browser command (default google-chrome-stable, else xdg-open)
+$CLAUDE_REPORTS_FOCUS     command run after opening, e.g. to raise the browser window;
+                          {title} is replaced by the page title (shell-quoted)
+$CLAUDE_REPORTS_ASSETS    live-preview.nvim's static/ folder, for markdown-it rendering
+                          (default: its lazy.nvim path; falls back to python-markdown)
+$CLAUDE_REPORTS_RESUME    resume command (default $CLAUDE_SESSIONS_RESUME, else
+                          "claude --resume {id}"); used when claude-sessions is not installed
+"""
+
+import hmac
+import html
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
+
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+STATE = Path(os.environ.get("CLAUDE_REPORTS_DIR") or XDG_STATE / "claude-reports")
+KEEP_DAYS = float(os.environ.get("CLAUDE_REPORTS_KEEP_DAYS") or 14)
+ASSETS = Path(os.environ.get("CLAUDE_REPORTS_ASSETS")
+              or Path.home() / ".local/share/nvim/lazy/live-preview.nvim/static")
+RESUME = (os.environ.get("CLAUDE_REPORTS_RESUME") or os.environ.get("CLAUDE_SESSIONS_RESUME")
+          or "claude --resume {id}")
+PORT = int(os.environ.get("CLAUDE_REPORTS_PORT") or 47823)
+IDLE = float(os.environ.get("CLAUDE_REPORTS_IDLE") or 1800)
+TASKS = Path(os.environ.get("CLAUDE_TASKS_DIR") or XDG_STATE / "claude-tasks")
+SELF = os.path.realpath(__file__)
+ID = re.compile(r"^[A-Za-z0-9-]+$")
+
+# ---------------------------------------------------------------- reading the transcript
+# Same cleaning rules as claude-sessions: only what you and Claude wrote counts.
+
+SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+PASTE_TAG = re.compile(r"</?pasted_content[^>]*>")
+COMMAND = re.compile(r"<command-name>(.*?)</command-name>.*?<command-args>(.*?)</command-args>", re.S)
+BASH_INPUT = re.compile(r"<bash-input>(.*?)</bash-input>", re.S)
+NOISE = re.compile(
+    r"\s*(<(local-command-\w+|bash-std\w+|task-notification|command-message)\b"
+    r"|\[Request interrupted by user)"
+)
+INTERRUPTED = re.compile(r"\s*\[Request interrupted by user")
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def clean_prompt(text):
+    """(prompt text, is a slash command); ("", _) for things that are not a prompt."""
+    text = SYSTEM_REMINDER.sub("", text)
+    if m := COMMAND.search(text):
+        name, args = m.group(1).strip(), m.group(2).strip()
+        return (f"{name} {args}" if args else ""), True
+    if m := BASH_INPUT.search(text):
+        return "! " + m.group(1).strip(), True
+    if NOISE.match(text):
+        return "", False
+    return PASTE_TAG.sub("", text).strip(), False
+
+
+def parse(path):
+    """What a report needs from a transcript: metadata, prompts, files, and the final reply."""
+    s = {"cwd": None, "branch": None, "started": None, "last": None, "entrypoint": None,
+         "titles": {}, "prompts": [], "replies": [], "files": {}, "turn_files": {}, "final": [],
+         "said": "",
+         "interrupted": False,
+         "pending_tool": False}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue  # e.g. a half-written last line
+            if not isinstance(r, dict):
+                continue
+            kind = r.get("type")
+            if kind == "custom-title" and r.get("customTitle"):
+                s["titles"]["custom"] = r["customTitle"]
+            elif kind == "ai-title" and r.get("aiTitle"):
+                s["titles"]["ai"] = r["aiTitle"]
+            elif kind == "summary" and r.get("summary"):
+                s["titles"].setdefault("ai", r["summary"])
+            if kind not in ("user", "assistant") or not isinstance(r.get("message"), dict):
+                continue
+            if any(r.get(k) for k in ("isSidechain", "isMeta", "isCompactSummary",
+                                      "isVisibleInTranscriptOnly", "isApiErrorMessage")):
+                continue
+            s["cwd"] = r.get("cwd") or s["cwd"]
+            s["branch"] = r.get("gitBranch") or s["branch"]
+            s["started"] = s["started"] or r.get("timestamp")
+            s["last"] = max(s["last"] or "", r.get("timestamp") or "") or None
+            s["entrypoint"] = s["entrypoint"] or r.get("entrypoint")
+            content = r["message"].get("content")
+            if kind == "user":
+                origin = r.get("origin")
+                if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+                    continue
+                if isinstance(content, list) and any(
+                        isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                    s["pending_tool"] = False
+                    continue
+                raw = CONTROL.sub("", text_of(content))
+                if INTERRUPTED.match(raw):
+                    s["interrupted"] = True
+                    continue
+                text, is_command = clean_prompt(raw)
+                if text and not is_command:
+                    if s["prompts"]:  # close the previous turn: keep what Claude answered
+                        s["replies"].append("\n\n".join(s["final"]) or s["said"])
+                    s["prompts"].append(text)
+                    s["final"], s["said"], s["interrupted"], s["pending_tool"] = [], "", False, False
+                    s["turn_files"] = {}
+                continue
+            # assistant: the final reply is the text after the last tool call of the last turn
+            if not isinstance(content, list):
+                content = [{"type": "text", "text": content}] if isinstance(content, str) else []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use":
+                    s["final"], s["pending_tool"] = [], True
+                    if b.get("name") in EDIT_TOOLS:
+                        inp = b.get("input") or {}
+                        p = inp.get("file_path") or inp.get("notebook_path")
+                        if isinstance(p, str) and p:
+                            s["files"][p] = s["turn_files"][p] = None
+                elif b.get("type") == "text":
+                    t = CONTROL.sub("", b.get("text") or "").strip()
+                    if t and t != "(no content)" and s["prompts"]:
+                        s["final"].append(t)
+                        s["said"] = t  # last text of the turn, even if tool calls followed
+    return s
+
+
+# ---------------------------------------------------------------- writing a report
+
+def tmux(*args):
+    try:
+        return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def tmux_info(pane):
+    """{"target": "session:window.pane", "session", "pane_title", "watched"} or {}.
+
+    watched: the pane is the active one of its window, the window is the active one of its
+    session, and a terminal showing that session has focus (tmux focus-events). Without focus
+    events no client is ever "focused", so nothing counts as watched and every reply is unread.
+    """
+    if not pane:
+        return {}
+    out = tmux("display", "-p", "-t", pane,
+               "#S\x1f#I\x1f#P\x1f#{pane_active}#{window_active}\x1f#{pane_title}").rstrip("\n")
+    parts = out.split("\x1f", 4)
+    if len(parts) != 5:
+        return {}
+    sess, win, idx, active, title = parts
+    if not sess or not win:
+        return {}  # the pane is gone (e.g. tmux is tearing it down)
+    focused = any(
+        line.split("\t")[0] == sess and "focused" in line.split("\t")[-1].split(",")
+        for line in tmux("list-clients", "-F", "#{client_session}\t#{client_flags}").splitlines())
+    # Claude Code sets the pane title to its summary of the session, e.g. "✳ Fix login bug".
+    m = re.match(r"^[^\w\s]+\s+(.*)$", title)
+    title = m.group(1) if m else title
+    if title in ("", "Claude Code", os.uname().nodename):
+        title = ""
+    return {"target": f"{sess}:{win}.{idx}", "session": sess, "pane_title": title, "pane": pane,
+            "watched": active == "11" and focused}
+
+
+def local(ts):
+    """ISO timestamp (UTC, from the transcript) → local datetime, or None."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+
+
+def home(path):
+    h = str(Path.home())
+    return "~" + path[len(h):] if path and (path == h or path.startswith(h + "/")) else path
+
+
+def duration(a, b):
+    if not a or not b:
+        return ""
+    m = max(0, round((b - a).total_seconds() / 60))
+    if m == 0:
+        return "<1 min"
+    return f"{m} min" if m < 60 else f"{m // 60} h {m % 60:02d} min"
+
+
+def clip(text, n):
+    return text if len(text) <= n else text[:n].rstrip() + " …"
+
+
+def quote(text):
+    return "\n".join("> " + line if line.strip() else ">" for line in text.splitlines())
+
+
+def code(text):
+    """Inline code span that survives backticks in the text."""
+    ticks = "`" * (max((len(m) for m in re.findall(r"`+", text)), default=0) + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{ticks}{pad}{text}{pad}{ticks}"
+
+
+def build(sid, s, info, ended, last_message=None, background=0):
+    """(metadata dict, markdown) for a session's latest reply.
+
+    last_message is the Stop hook's last_assistant_message: Claude's final reply, which the
+    transcript may not hold yet when the hook runs.
+    """
+    title, title_kind = None, None
+    for kind, value in (("custom", s["titles"].get("custom")), ("ai", s["titles"].get("ai")),
+                        ("pane", info.get("pane_title")),
+                        ("prompt", s["prompts"][0].strip().splitlines()[0] if s["prompts"] else "")):
+        if value and value.strip():
+            title, title_kind = clip(value.strip(), 100), kind
+            break
+    final = "\n\n".join(s["final"])
+    if last_message and last_message.strip():
+        lm = last_message.strip()
+        # The transcript's version can hold more (several text blocks after the last tool
+        # call); use it when it ends with the same message.
+        if not (s["final"] and s["final"][-1].strip() == lm):
+            final = lm
+        unfinished = False
+    else:
+        unfinished = s["interrupted"] or s["pending_tool"] or not final
+    cwd = s["cwd"] or ""
+    start = local(s["started"])
+    end = datetime.fromtimestamp(ended).astimezone()
+
+    def rel(p):
+        return os.path.relpath(p, cwd) if cwd and p.startswith(cwd.rstrip("/") + "/") else home(p)
+
+    files = [rel(p) for p in s["turn_files"]]
+    meta = {
+        "id": sid, "title": title or "(untitled)", "title_kind": title_kind,
+        "tmux": info.get("target", ""), "tmux_session": info.get("session", ""),
+        "pane": info.get("pane", ""),
+        "cwd": cwd, "branch": s["branch"] or "", "started": s["started"],
+        "ended": ended, "prompts": len(s["prompts"]), "files": files,
+        "unfinished": unfinished, "background": background,
+        "unread": not info.get("watched", False),
+    }
+
+    rows = []
+    if meta["tmux"]:
+        rows.append(("tmux", code(meta["tmux"])))
+    rows.append(("Folder", code(home(cwd) or "?")))
+    if meta["branch"]:
+        rows.append(("Branch", code(meta["branch"])))
+    rows.append(("Finished", f"{end:%Y-%m-%d %H:%M}"))
+    if start:
+        rows.append(("Session", f"started {start:%Y-%m-%d %H:%M} ({duration(start, end)}), "
+                                f"prompt {len(s['prompts'])}"))
+    rows.append(("Id", code(sid)))
+
+    md = [f"# {title or '(untitled)'}", ""]
+    if unfinished:
+        md += ["> **Unfinished:** the session ended before Claude finished its reply.", ""]
+    if background:
+        md += [f"> **Still working:** {background} background task{'s' if background > 1 else ''} "
+               "running; Claude may continue and update this report.", ""]
+    md += ["| | |", "|---|---|"]
+    md += [f"| **{k}** | {v.replace('|', chr(92) + '|')} |" for k, v in rows] + [""]
+    if s["prompts"]:
+        md += ["## Asked", "", quote(clip(s["prompts"][-1], 3000)), ""]
+    if final:
+        md += ["## Report", "", final, ""]
+    elif s["said"]:
+        md += ["## Report", "", "*Last thing Claude wrote before the session ended:*", "",
+               s["said"], ""]
+    else:
+        md += ["## Report", "", "*(no reply)*", ""]
+    if files:
+        md += ["## Files changed", ""] + [f"- {code(f)}" for f in files] + [""]
+    turns = earlier_turns(s)
+    if turns:
+        # Plain markdown for the terminal preview; the browser page shows these collapsed.
+        md += [EARLIER, ""]
+        for t in turns:
+            md += [f"### {t['n']}. {clip(' '.join(t['prompt'].split()), 150)}", "",
+                   clip(t["reply"], 1500) if t["reply"] else "*(no reply)*", ""]
+        hidden = len(s["prompts"]) - 1 - len(turns)
+        if hidden:
+            md += [f"*{hidden} older prompt{'s' if hidden > 1 else ''} not shown*", ""]
+    return meta, "\n".join(md)
+
+
+EARLIER = "## Earlier in this session"
+MAX_TURNS = 20
+
+
+def earlier_turns(s):
+    """The turns before the latest one, newest first: [{"n", "prompt", "reply"}]."""
+    turns = [{"n": i + 1, "prompt": p, "reply": r}
+             for i, (p, r) in enumerate(zip(s["prompts"][:-1], s["replies"]))]
+    return turns[::-1][:MAX_TURNS]
+
+
+def write_atomic(path, text):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def prune():
+    cutoff = time.time() - KEEP_DAYS * 86400
+    for f in STATE.glob("*.json"):
+        if "." in f.stem:
+            continue  # <id>.turns.json goes with its report
+        meta = find(f.stem)
+        if meta is None or meta.get("ended", 0) < cutoff:
+            remove(f.stem)
+    for f in STATE.glob("*.turns.json"):  # orphans
+        if not (STATE / f"{f.name[:-len('.turns.json')]}.json").exists():
+            f.unlink(missing_ok=True)
+
+
+def remove(sid):
+    for p in (STATE / f"{sid}.json", STATE / f"{sid}.md", STATE / f"{sid}.turns.json",
+              STATE / "html" / f"{sid}.html"):
+        p.unlink(missing_ok=True)
+
+
+def refresh_status():
+    for client in tmux("list-clients", "-F", "#{client_name}").split():
+        tmux("refresh-client", "-S", "-t", client)
+
+
+def hook():
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return
+    if data.get("hook_event_name") not in (None, "Stop"):
+        return  # e.g. an old SessionEnd entry: the last Stop already wrote the report
+    sid, transcript = data.get("session_id") or "", data.get("transcript_path") or ""
+    if not ID.match(sid) or not os.path.isfile(transcript):
+        return
+    s = parse(transcript)
+    pane = os.environ.get("TMUX_PANE", "")
+    # `claude -p` and SDK runs from scripts would flood the list; inside tmux they are yours.
+    if not s["prompts"] or ((s["entrypoint"] or "").startswith("sdk") and not pane):
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    bg = data.get("background_tasks")
+    meta, md = build(sid, s, tmux_info(pane), time.time(), data.get("last_assistant_message"),
+                     len(bg) if isinstance(bg, list) else 0)
+    write_atomic(STATE / f"{sid}.md", md)
+    write_atomic(STATE / f"{sid}.turns.json", json.dumps(earlier_turns(s), ensure_ascii=False))
+    write_atomic(STATE / f"{sid}.json", json.dumps(meta, ensure_ascii=False, indent=1))
+    (STATE / "html" / f"{sid}.html").unlink(missing_ok=True)
+    prune()
+    refresh_status()
+
+
+# ---------------------------------------------------------------- reading reports
+
+def find(sid):
+    """A report's metadata, or None."""
+    if not ID.match(sid or ""):
+        return None
+    try:
+        m = json.loads((STATE / f"{sid}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return m if isinstance(m, dict) and m.get("id") == sid else None
+
+
+def load(sid):
+    if not ID.match(sid or ""):
+        sys.exit(f"claude-reports: bad id {sid!r}")
+    if (m := find(sid)) is None:
+        sys.exit(f"claude-reports: no report {sid}")
+    return m
+
+
+def reports():
+    out = [m for f in STATE.glob("*.json") if "." not in f.stem and (m := find(f.stem))]
+    out.sort(key=lambda m: (not m.get("unread"), -m.get("ended", 0)))
+    return out
+
+
+def set_unread(meta, unread):
+    if meta.get("unread") != unread:
+        meta["unread"] = unread
+        write_atomic(STATE / f"{meta['id']}.json", json.dumps(meta, ensure_ascii=False, indent=1))
+
+
+def ago(epoch):
+    s = int(time.time() - epoch)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def fit(text, n):
+    text = " ".join(str(text).split())
+    return (text if len(text) <= n else text[:n - 1] + "…").ljust(n)
+
+
+# ---------------------------------------------------------------- open sessions
+# Which sessions are open right now, from tmux-claude-tasks' per-pane state files:
+# "status<TAB>epoch<TAB>cwd<TAB>session id<TAB>pid start", where "pid start" identifies the
+# process hosting the session (start = /proc/PID/stat field 22, fixed for a process's life).
+
+def started(pids):
+    out = set()
+    for pid in pids:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            continue
+        out.add(f"{pid} {stat[stat.rindex(')') + 2:].split()[19]}")
+    return out
+
+
+def live_sessions():
+    """{session id: (pane id, "session:window.pane")} for sessions open in a tmux pane."""
+    try:
+        files = list(TASKS.iterdir())
+    except OSError:
+        return {}
+    panes = {}
+    for line in tmux("list-panes", "-a", "-F", "#{pane_id}\t#S:#I.#P").splitlines():
+        if "\t" in line:
+            pane, target = line.split("\t", 1)
+            panes[pane] = target
+    entries = []
+    for f in files:
+        try:
+            fields = f.read_text().rstrip("\n").split("\t")
+        except OSError:
+            continue
+        pane = "%" + f.name
+        if len(fields) >= 4 and fields[3] and pane in panes:
+            entries.append((fields[3], pane, fields[4] if len(fields) > 4 else ""))
+    alive = started({p for _, _, proc in entries if (p := proc.split(" ", 1)[0]).isdigit()})
+    alive_pids = {a.split(" ", 1)[0] for a in alive}
+
+    def running(proc):
+        if not proc or proc in alive:
+            return True  # entries from before claude-tasks recorded the process stay visible
+        # recorded by an older claude-tasks as "pid weekday month day time year": pid only
+        return proc.count(" ") > 1 and proc.split(" ", 1)[0] in alive_pids
+
+    return {sid: (pane, panes[pane]) for sid, pane, proc in entries if running(proc)}
+
+
+def list_reports():
+    live = live_sessions()
+    for m in reports():
+        icon, color = ("●", "32") if m.get("unread") else ("○", "90")
+        if m.get("unfinished"):
+            icon, color = ("!", "31") if m.get("unread") else ("!", "90")
+        folder = os.path.basename((m.get("cwd") or "").rstrip("/")) or "?"
+        where = f"\x1b[36m▶ {fit(live[m['id']][1], 18)}\x1b[0m" if m["id"] in live \
+            else f"\x1b[90m  {fit('closed', 18)}\x1b[0m"
+        print(f"{m['id']}\t\x1b[{color}m{icon}\x1b[0m {fit(m.get('title', ''), 38)}  {where} "
+              f"\x1b[90m{fit(folder, 14)} {ago(m.get('ended', 0)):>4}\x1b[0m")
+
+
+def show(sid):
+    load(sid)
+    sys.stdout.write((STATE / f"{sid}.md").read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------- tmux, Konsole, KWin
+
+def tmux_env():
+    """Environment for programs that expect to run inside tmux (claude-sessions open)."""
+    env = dict(os.environ)
+    if not env.get("TMUX"):
+        sock = tmux("display", "-p", "#{socket_path}").strip()
+        if sock:
+            env["TMUX"] = f"{sock},0,0"
+    if not env.get("CLAUDE_SESSIONS_RESUME"):
+        # The service doesn't see your shell's variables; tmux options it can read.
+        cmd = tmux("show", "-gqv", "@claude-tasks-resume-command").strip()
+        if cmd:
+            env["CLAUDE_SESSIONS_RESUME"] = cmd
+    return env
+
+
+def latest_client():
+    """(client name, client pid) of the tmux client used most recently, or None."""
+    best = None
+    for line in tmux("list-clients", "-F", "#{client_activity}\t#{client_name}\t#{client_pid}").splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0].isdigit() and (best is None or int(parts[0]) > best[0]):
+            best = (int(parts[0]), parts[1], parts[2])
+    return best and (best[1], best[2])
+
+
+def ancestors(pid):
+    """[pid, parent, grandparent, ...] up to (not including) init."""
+    chain = []
+    pid = int(pid)
+    while pid > 1 and len(chain) < 64:
+        chain.append(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            break
+        pid = int(stat[stat.rindex(")") + 2:].split()[1])
+    return chain
+
+
+def comm(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def qdbus(*args):
+    try:
+        return subprocess.run(["qdbus6", *map(str, args)], capture_output=True, text=True,
+                              timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def select_konsole_tab(chain):
+    """In the Konsole that hosts this process chain, make the tab running it current."""
+    for i, pid in enumerate(chain):
+        if comm(pid) == "konsole" and i > 0:
+            svc, shell = f"org.kde.konsole-{pid}", chain[i - 1]
+            for obj in qdbus(svc).splitlines():
+                if re.fullmatch(r"/Windows/\d+", obj):
+                    for sess in qdbus(svc, obj, "org.kde.konsole.Window.sessionList").split():
+                        if qdbus(svc, f"/Sessions/{sess}", "org.kde.konsole.Session.processId") == str(shell):
+                            qdbus(svc, obj, "org.kde.konsole.Window.setCurrentSession", sess)
+                            return
+
+
+KWIN_RAISE = """
+const pids = %s;
+let best = null;
+for (const w of workspace.stackingOrder) {
+  if (w.normalWindow && pids.includes(w.pid)) best = w;  // last match = topmost
+}
+if (best) {
+  if (best.minimized) best.minimized = false;
+  if (!best.onAllDesktops && best.desktops.length && !best.desktops.includes(workspace.currentDesktop))
+    workspace.currentDesktop = best.desktops[0];
+  workspace.activeWindow = best;
+}
+"""
+
+
+def raise_window(chain):
+    """Activate the window owned by the nearest process in chain, via a one-off KWin script.
+    Scripts are trusted by KWin, so this works whatever the focus-stealing setting is."""
+    if not chain or not shutil.which("qdbus6"):
+        return False
+    script = STATE / "kwin-raise.js"
+    write_atomic(script, KWIN_RAISE % json.dumps(chain))
+    name = f"claude-reports-{os.getpid()}-{time.monotonic_ns()}"
+    sid = qdbus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", script, name)
+    if not sid.isdigit():
+        return False
+    qdbus("org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run")
+    time.sleep(0.2)
+    qdbus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", name)
+    return True
+
+
+def focus_pane(pane):
+    """Show the pane in the most recently used tmux client and raise that terminal."""
+    client = latest_client()
+    if not client:
+        return False, "no terminal is attached to tmux"
+    name, pid = client
+    tmux("switch-client", "-c", name, "-t", pane, ";", "select-window", "-t", pane, ";",
+         "select-pane", "-t", pane)
+    chain = ancestors(pid)
+    select_konsole_tab(chain)
+    raise_window(chain)
+    return True, "focused"
+
+
+# ---------------------------------------------------------------- actions
+
+def resume(sid):
+    """Go to the session: jump to its pane if open, else resume it in a new tmux window."""
+    meta = load(sid)
+    set_unread(meta, False)
+    env = tmux_env()
+    # claude-sessions jumps to the pane if the session is still open, else resumes it.
+    if shutil.which("claude-sessions"):
+        r = subprocess.run(["claude-sessions", "open", sid], capture_output=True, text=True, env=env)
+        if r.returncode == 0:
+            return
+    cwd = meta.get("cwd") or ""
+    if not os.path.isdir(cwd):
+        msg = f"claude-reports: project folder {cwd} no longer exists"
+        tmux("display-message", msg)
+        sys.exit(msg)
+    cmd = RESUME.replace("{id}", shlex.quote(sid))
+    if env.get("TMUX"):
+        # Typed into a shell, so the window stays usable after claude exits.
+        pane = tmux("new-window", "-P", "-F", "#{pane_id}", "-c", cwd).strip()
+        tmux("send-keys", "-t", pane, "-l", cmd)
+        tmux("send-keys", "-t", pane, "Enter")
+    else:
+        os.chdir(cwd)
+        shell = os.environ.get("SHELL") or "/bin/sh"
+        os.execvp(shell, [shell, "-c", cmd])
+
+
+def state_of(meta, live=None):
+    live = live_sessions() if live is None else live
+    pane = live.get(meta["id"])
+    return {"id": meta["id"], "unread": bool(meta.get("unread")), "open": bool(pane),
+            "target": pane[1] if pane else "", "version": meta.get("ended", 0)}
+
+
+def act(action, sid):
+    """Run a button's action. (HTTP status, message)."""
+    meta = find(sid)
+    if meta is None:
+        return 404, "no such report"
+    if action in ("read", "unread"):
+        set_unread(meta, action == "unread")
+        refresh_status()
+        return 200, f"marked {action}"
+    live = live_sessions()
+    if action == "focus":
+        set_unread(meta, False)
+        refresh_status()
+        if sid in live:
+            ok, msg = focus_pane(live[sid][0])
+            return (200 if ok else 409), msg
+        try:
+            resume(sid)
+        except SystemExit as e:
+            return 409, str(e)
+        client = latest_client()
+        if client:
+            chain = ancestors(client[1])
+            select_konsole_tab(chain)
+            raise_window(chain)
+        return 200, "resumed in a new tmux window"
+    if action == "kill":
+        # Only a pane that still runs this very session: claude-tasks recorded the session id
+        # for the pane and the process hosting it is still alive. A stale report must never
+        # kill whatever runs in that pane now.
+        if sid not in live:
+            return 409, "the session isn't open in tmux anymore"
+        pane, target = live[sid]
+        tmux("kill-pane", "-t", pane)
+        set_unread(meta, False)
+        refresh_status()
+        return 200, f"killed {target}"
+    return 404, "unknown action"
+
+
+# ---------------------------------------------------------------- HTML
+
+PAGE_CSS = """
+:root { color-scheme: light dark; --bar: #f6f8fa; --line: #d0d7de; --fg: #1f2328; --muted: #59636e;
+        --btn: #fff; --btn-hover: #eef1f4; --danger: #cf222e; }
+@media (prefers-color-scheme: dark) {
+  :root { --bar: #161b22; --line: #30363d; --fg: #e6edf3; --muted: #9198a1;
+          --btn: #21262d; --btn-hover: #30363d; --danger: #f85149; } }
+body { margin: 0; background: #fff; }
+@media (prefers-color-scheme: dark) { body { background: #0d1117; } }
+.markdown-body { box-sizing: border-box; max-width: 960px; margin: 0 auto; padding: 32px 24px 64px; }
+.markdown-body > table:first-of-type thead { display: none; }
+.markdown-body > table:first-of-type td:first-child { white-space: nowrap; }
+.markdown-body details.turn { border: 1px solid var(--line); border-radius: 6px; padding: 0 16px; margin: 0 0 8px; }
+.markdown-body details.turn > summary { cursor: pointer; padding: 10px 0; font-weight: 600; }
+.markdown-body details.turn > summary .n { color: var(--muted); font-weight: 400; margin-right: 6px; }
+.markdown-body details.turn blockquote { white-space: pre-wrap; }
+.bar .newer { display: none; color: #1f6feb; font-weight: 600; }
+.bar .newer.on { display: inline-block; }
+.bar { position: sticky; top: 0; z-index: 1; background: var(--bar); border-bottom: 1px solid var(--line);
+       font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", sans-serif; }
+.bar-in { max-width: 960px; margin: 0 auto; padding: 8px 24px; box-sizing: border-box;
+          display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.bar button { font: inherit; color: var(--fg); background: var(--btn); border: 1px solid var(--line);
+              border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+.bar button:hover:not(:disabled) { background: var(--btn-hover); }
+.bar button:disabled { opacity: .45; cursor: default; }
+.bar button.danger { color: var(--danger); }
+.bar .status { color: var(--muted); margin-left: auto; }
+.bar kbd { font: 12px ui-monospace, monospace; }
+@media (max-width: 600px) { .markdown-body { padding: 16px; } .bar-in { padding: 8px 16px; }
+                            .bar .status { margin-left: 0; width: 100%; } }
+"""
+
+RENDER_JS = """
+const src = JSON.parse(document.getElementById('src').textContent);
+const md = window.markdownit({ html: false, linkify: true, highlight: (str, lang) => {
+  if (window.hljs && lang && hljs.getLanguage(lang)) {
+    try { return hljs.highlight(str, { language: lang }).value; } catch (_) {}
+  }
+  return '';
+}});
+const article = document.querySelector('.markdown-body');
+article.innerHTML = md.render(src);
+// Earlier turns, collapsed. Prompts go in as text, replies through markdown-it (html: false).
+const turnsEl = document.getElementById('turns');
+const turns = turnsEl ? JSON.parse(turnsEl.textContent) : [];
+if (turns.length) {
+  const h = document.createElement('h2');
+  h.textContent = 'Earlier in this session';
+  article.appendChild(h);
+  for (const t of turns) {
+    const d = document.createElement('details');
+    d.className = 'turn';
+    const sum = document.createElement('summary');
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = t.n + '.';
+    const one = t.prompt.replace(/\\s+/g, ' ').trim();
+    sum.append(n, one.length > 140 ? one.slice(0, 139) + '…' : one);
+    const q = document.createElement('blockquote');
+    q.textContent = t.prompt;
+    const r = document.createElement('div');
+    r.innerHTML = t.reply ? md.render(t.reply) : '<p><em>(no reply)</em></p>';
+    d.append(sum, q, r);
+    article.appendChild(d);
+  }
+}
+"""
+
+BAR_HTML = """<div class="bar"><div class="bar-in">
+<button id="focus" title="Show the pane in tmux and raise its Konsole window">Go to pane</button>
+<button id="read">Mark read</button>
+<button id="kill" class="danger" title="Kill the Claude session and close its tmux pane">Kill session</button>
+<button id="newer" class="newer" title="Claude replied again since this page was loaded">New reply · Reload</button>
+<span class="status" id="status"></span></div></div>"""
+
+BAR_JS = """
+const ID = %s, TOKEN = %s, VERSION = %s;
+const $ = (id) => document.getElementById(id);
+let state = null;
+function show(s, note) {
+  state = s;
+  $('newer').classList.toggle('on', s.version > VERSION);
+  $('focus').textContent = s.open ? 'Go to pane' : 'Resume session';
+  $('focus').title = s.open ? 'Show the pane in tmux and raise its Konsole window'
+                            : 'The session is closed: resume it in a new tmux window';
+  $('read').textContent = s.unread ? 'Mark read' : 'Mark unread';
+  $('kill').disabled = !s.open;
+  $('status').textContent = note || (s.open ? 'Open in ' + s.target : 'Session closed') +
+                                    (s.unread ? ' · unread' : '');
+}
+async function call(method, path) {
+  try {
+    const r = await fetch(path, { method, headers: { 'X-Claude-Reports': TOKEN } });
+    const body = await r.json();
+    if (body.state) show(body.state, r.ok ? body.message : 'Error: ' + body.message);
+    else $('status').textContent = r.status === 404 ? 'This report was deleted'
+                                                    : 'Error: ' + (body.message || r.status);
+    return body.state;
+  } catch (e) {
+    $('status').textContent = 'claude-reports server is not running (reopen from the popup)';
+  }
+}
+const refresh = () => call('GET', '/api/state/' + ID);
+$('newer').onclick = () => location.reload();
+$('focus').onclick = () => call('POST', '/api/focus/' + ID);
+$('read').onclick = () => call('POST', '/api/' + (state && !state.unread ? 'unread' : 'read') + '/' + ID);
+$('kill').onclick = () => {
+  if (confirm('Kill this Claude session and close its tmux pane (' + state.target + ')?\\n\\nThe report stays.'))
+    call('POST', '/api/kill/' + ID);
+};
+// Check for a newer reply when you come back to the tab, and every 5 s while it's visible.
+window.addEventListener('focus', refresh);
+setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 5000);
+// Opening a report means reading it; "Mark unread" undoes that.
+refresh().then((s) => { if (s && s.unread) call('POST', '/api/read/' + ID); });
+"""
+
+
+def page_title(meta):
+    # Unique, so a window manager script can find the browser window showing it.
+    return f"{meta.get('title', 'Report')} · claude-report {meta['id'][:8]}"
+
+
+def render(meta, md, token=None, nonce=None, turns=None):
+    """A report page. With a token it is served by `claude-reports serve`: assets come from
+    /assets/ and the page gets the button bar. Without, it is a standalone file:// page.
+
+    markdown-it (from live-preview.nvim, so it looks like <leader>mp) when its files are there;
+    else python-markdown; else preformatted text."""
+    served = token is not None
+
+    def asset(rel):
+        return f"/assets/{rel}" if served else (ASSETS / rel).as_uri()
+
+    n = f' nonce="{nonce}"' if nonce else ""
+    head = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{html.escape(page_title(meta))}</title>')
+    if (ASSETS / "markdown/github-markdown.min.css").is_file():
+        head += f'<link rel="stylesheet" href="{asset("markdown/github-markdown.min.css")}">'
+    head += f"<style{n}>{PAGE_CSS}</style>"
+    body = BAR_HTML if served else ""
+    if (ASSETS / "markdown/markdown-it.min.js").is_file():
+        if (ASSETS / "highlight/highlight.min.js").is_file():
+            head += (f'<link rel="stylesheet" href="{asset("highlight/main.css")}">'
+                     f'<script src="{asset("highlight/highlight.min.js")}"></script>')
+        if turns and f"\n{EARLIER}\n" in md:
+            md = md.split(f"\n{EARLIER}\n", 1)[0]  # shown collapsed from the turns instead
+        data = json.dumps(md).replace("</", "<\\/")
+        body += (f'<article class="markdown-body"></article>'
+                 f'<script type="application/json" id="src">{data}</script>'
+                 f'<script type="application/json" id="turns">'
+                 f'{json.dumps(turns or []).replace("</", "<" + chr(92) + "/")}</script>'
+                 f'<script src="{asset("markdown/markdown-it.min.js")}"></script>'
+                 f'<script{n}>{RENDER_JS}</script>')
+    else:
+        try:
+            import markdown
+            conv = markdown.Markdown(extensions=["extra", "sane_lists"])
+            # Reports contain arbitrary transcript text: show raw HTML as text, don't run it.
+            conv.preprocessors.deregister("html_block")
+            conv.inlinePatterns.deregister("html")
+            inner = conv.convert(md)
+        except ImportError:
+            inner = f"<pre>{html.escape(md)}</pre>"
+        body += f'<article class="markdown-body">{inner}</article>'
+    if served:
+        js = BAR_JS % (json.dumps(meta["id"]), json.dumps(token), json.dumps(meta.get("ended", 0)))
+        body += f"<script{n}>{js.replace('</', '<' + chr(92) + '/')}</script>"
+    return f"{head}</head><body>{body}</body></html>\n"
+
+
+# ---------------------------------------------------------------- server
+# Serves the report pages and runs the buttons, on 127.0.0.1 only. See README "Safety".
+
+def token():
+    """The server's secret: random, made once, readable only by you (mode 600)."""
+    path = STATE / "token"
+    try:
+        t = path.read_text().strip()
+    except OSError:
+        t = ""
+    if len(t) < 64:
+        t = secrets.token_hex(32)
+        tmp = path.with_name("token.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(t + "\n")
+        tmp.replace(path)
+    return t
+
+
+ASSET_TYPES = {".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2",
+               ".woff": "font/woff", ".ttf": "font/ttf", ".svg": "image/svg+xml"}
+
+
+def make_handler(port, secret, touch):
+    from http.server import BaseHTTPRequestHandler
+
+    origins = {f"127.0.0.1:{port}", f"localhost:{port}"}
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "claude-reports"
+        sys_version = ""
+
+        def log_message(self, *args):
+            pass
+
+        def send(self, status, body, ctype="application/json", headers=()):
+            data = body if isinstance(body, bytes) else body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", ctype + ("; charset=utf-8" if ctype.startswith(("text/", "application/json")) else ""))
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            for k, v in headers:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def reply(self, status, message, sid=None):
+            body = {"message": message}
+            if sid and (meta := find(sid)):
+                body["state"] = state_of(meta)
+            self.send(status, json.dumps(body))
+
+        def host_ok(self):
+            # Blocks DNS rebinding: a hostile site whose name resolves to 127.0.0.1 still
+            # sends its own name as Host, so it can't read anything from here.
+            return self.headers.get("Host") in origins
+
+        def cookie_ok(self):
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "claude_reports" and hmac.compare_digest(v.encode(), secret.encode()):
+                    return True
+            return False
+
+        def do_GET(self):
+            touch()
+            if not self.host_ok():
+                return self.send(403, "forbidden", "text/plain")
+            url = urlsplit(self.path)
+            if url.path == "/ping":
+                return self.send(200, "claude-reports", "text/plain")
+            if url.path.startswith("/assets/"):
+                return self.asset(unquote(url.path[len("/assets/"):]))
+            if m := re.fullmatch(r"/r/([A-Za-z0-9-]+)", url.path):
+                sid = m.group(1)
+                t = parse_qs(url.query).get("t", [""])[0]
+                if t and hmac.compare_digest(t.encode(), secret.encode()):
+                    # Trade the token in the URL for a cookie, then drop it from the address bar.
+                    return self.send(303, "", "text/plain", [
+                        ("Location", f"/r/{sid}"),
+                        ("Set-Cookie", f"claude_reports={secret}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000")])
+                if not self.cookie_ok():
+                    return self.send(403, "Open this report from the claude-reports popup.", "text/plain")
+                meta = find(sid)
+                if meta is None:
+                    return self.send(404, "No such report (deleted or pruned).", "text/plain")
+                md = (STATE / f"{sid}.md").read_text(encoding="utf-8")
+                nonce = secrets.token_urlsafe(16)
+                csp = (f"default-src 'none'; script-src 'self' 'nonce-{nonce}'; "
+                       f"style-src 'self' 'nonce-{nonce}'; font-src 'self'; img-src 'self' data:; "
+                       "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+                try:
+                    turns = json.loads((STATE / f"{sid}.turns.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    turns = None  # reports from before turns were kept: the markdown has them
+                return self.send(200, render(meta, md, secret, nonce, turns), "text/html",
+                                 [("Content-Security-Policy", csp)])
+            if m := re.fullmatch(r"/api/state/([A-Za-z0-9-]+)", url.path):
+                if not (self.cookie_ok() and self.header_token_ok()):
+                    return self.reply(403, "forbidden")
+                return self.reply(200, "", m.group(1)) if find(m.group(1)) else self.reply(404, "no such report")
+            self.send(404, "not found", "text/plain")
+
+        def header_token_ok(self):
+            # A custom header: browsers only let a page send one cross-origin after a CORS
+            # preflight, which this server never approves.
+            return hmac.compare_digest((self.headers.get("X-Claude-Reports") or "").encode(), secret.encode())
+
+        def do_POST(self):
+            touch()
+            origin = self.headers.get("Origin")
+            if not (self.host_ok() and origin in {f"http://{o}" for o in origins}
+                    and self.cookie_ok() and self.header_token_ok()):
+                return self.reply(403, "forbidden")
+            m = re.fullmatch(r"/api/(read|unread|focus|kill)/([A-Za-z0-9-]+)", urlsplit(self.path).path)
+            if not m:
+                return self.reply(404, "not found")
+            status, msg = act(m.group(1), m.group(2))
+            self.reply(status, msg, m.group(2))
+
+        def asset(self, rel):
+            root = ASSETS.resolve()
+            path = (root / rel).resolve()
+            if not path.is_relative_to(root) or path.suffix not in ASSET_TYPES or not path.is_file():
+                return self.send(404, "not found", "text/plain")
+            self.send(200, path.read_bytes(), ASSET_TYPES[path.suffix])
+
+    return Handler
+
+
+def serve():
+    """HTTP server on 127.0.0.1. Uses a listening socket from systemd (socket activation)
+    when given one; exits after $CLAUDE_REPORTS_IDLE seconds without requests."""
+    import socket
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    secret = token()
+    last = [time.monotonic()]
+    activated = os.environ.get("LISTEN_FDS") == "1" and os.environ.get("LISTEN_PID") == str(os.getpid())
+    if activated:
+        sock = socket.socket(fileno=3)
+        port = sock.getsockname()[1]
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), None, bind_and_activate=False)
+        httpd.socket.close()
+        httpd.socket = sock
+    else:
+        httpd = ThreadingHTTPServer(("127.0.0.1", PORT), None)
+        port = httpd.server_address[1]
+    httpd.RequestHandlerClass = make_handler(port, secret, lambda: last.__setitem__(0, time.monotonic()))
+    httpd.daemon_threads = True
+
+    def idle():
+        while time.monotonic() - last[0] < IDLE:
+            time.sleep(min(30, IDLE))
+        httpd.shutdown()
+
+    threading.Thread(target=idle, daemon=True).start()
+    httpd.serve_forever()
+
+
+def server_up():
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{PORT}/ping")
+        with urllib.request.urlopen(req, timeout=1) as r:
+            return r.read() == b"claude-reports"
+    except OSError:
+        return False
+
+
+def ensure_server():
+    """True when the server answers; starts one (it exits when idle) if nothing does."""
+    if server_up():
+        return True
+    proc = subprocess.Popen([SELF, "serve"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(30):
+        time.sleep(0.1)
+        if server_up():
+            return True
+        if proc.poll() is not None:
+            return False  # it couldn't start, e.g. something else holds the port
+    return False
+
+
+def open_report(sid):
+    meta = load(sid)
+    if ensure_server():
+        url = f"http://127.0.0.1:{PORT}/r/{sid}?t={token()}"
+    else:  # no server: a static page, without buttons
+        page = STATE / "html" / f"{sid}.html"
+        page.parent.mkdir(parents=True, exist_ok=True)
+        md = (STATE / f"{sid}.md").read_text(encoding="utf-8")
+        write_atomic(page, render(meta, md))
+        url = page.as_uri()
+        set_unread(meta, False)  # no page script to do it
+        refresh_status()
+    browser = os.environ.get("CLAUDE_REPORTS_BROWSER") or (
+        "google-chrome-stable" if shutil.which("google-chrome-stable") else "xdg-open")
+    subprocess.Popen([*shlex.split(browser), url], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    if focus := os.environ.get("CLAUDE_REPORTS_FOCUS"):
+        cmd = focus.replace("{title}", shlex.quote(page_title(meta)))
+        subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+# ---------------------------------------------------------------- picker
+
+def count(fmt_tmux):
+    n = sum(1 for m in reports() if m.get("unread"))
+    if not fmt_tmux:
+        print(n)
+    elif n:
+        print(f"#[fg=#a6e3a1]● {n} report{'s' if n > 1 else ''}#[default] ")
+
+
+def toggle(sid):
+    meta = load(sid)
+    set_unread(meta, not meta.get("unread"))
+    refresh_status()
+
+
+HELP_LABEL = " keys "  # header label while the full key list shows; there is no border, so unseen
+
+
+def help_text():
+    """(short header, full key list). One source for the picker and `keys-toggle`."""
+    short = "Enter open · c go to session · dd delete · ? more"
+    rows = [("j / k", "move"), ("g / G", "top / bottom"), ("Enter", "open in the browser"),
+            ("c", "go to the session (pane, or resume)"), ("m", "mark read / unread"),
+            ("dd", "delete the report"), ("a", "mark all read"), ("C-d / C-u", "scroll the preview"),
+            ("/", "filter (Esc leaves it)"), ("r", "refresh")]
+    if shutil.which("claude-tasks"):
+        rows.append(("t", "claude-tasks"))
+    rows += [("?", "close this help"), ("q / Esc", "quit")]
+    return short, "\n".join(f"{k:<10} {v}" for k, v in rows)
+
+
+def keys_toggle():
+    """fzf action for "?": swap the short header and the full key list. The header label
+    carries the state, because fzf doesn't expose the header text itself."""
+    short, full = help_text()
+    if os.environ.get("FZF_HEADER_LABEL") == HELP_LABEL:
+        print(f"change-header-label()+change-header:{short}")
+    else:
+        print(f"change-header-label({HELP_LABEL})+change-header:{full}")
+
+
+def ui():
+    if not shutil.which("fzf"):
+        sys.exit("claude-reports: needs fzf")
+    me = shlex.quote(SELF)
+    keys = "j,k,g,G,d,c,m,a,r,q,/,?"
+    header = help_text()[0]
+    extra = []
+    if shutil.which("claude-tasks"):
+        keys += ",t"
+        extra.append("--bind=t:become(claude-tasks)")
+    preview = f"{me} show {{1}}"
+    if shutil.which("bat"):
+        preview += (" | bat -l md --style=plain --color=always --paging=never"
+                    " --terminal-width=$FZF_PREVIEW_COLUMNS")
+    reset = "change-prompt(> )"
+    normal = f"rebind({keys})+hide-input+clear-query+{reset}"
+    dd = (f"[[ $FZF_PROMPT == 'd> ' ]] && echo '{reset}+execute-silent({me} delete {{1}})"
+          f"+reload({me} list)' || echo 'change-prompt(d> )'")
+    listing = subprocess.run([SELF, "list"], capture_output=True, text=True).stdout
+    if not listing:
+        listing = "-\t\x1b[90m(no reports yet: one appears each time Claude finishes a reply)\x1b[0m\n"
+    subprocess.run([
+        "fzf", "--ansi", "--no-sort", "--no-input", "--delimiter=\t", "--with-nth=2",
+        "--layout=reverse", "--border=rounded", "--border-label= Claude reports ",
+        f"--header={header}", "--header-first", "--info=hidden", "--pointer=▌",
+        "--gutter= ", "--prompt=> ", "--with-shell=bash -c",
+        f"--preview={preview}", "--preview-window=right,50%,wrap,<70(down,60%,wrap)",
+        f"--bind=j:down+{reset},k:up+{reset},g:first+{reset},G:last+{reset},q:abort",
+        "--bind=ctrl-d:preview-half-page-down,ctrl-u:preview-half-page-up",
+        f"--bind=enter:execute-silent({me} open {{1}})+abort",
+        f"--bind=c:execute-silent({me} resume {{1}})+abort",
+        f"--bind=m:execute-silent({me} toggle {{1}})+reload({me} list)+{reset}",
+        f"--bind=d:transform:{dd}",
+        f"--bind=a:execute-silent({me} read-all)+reload({me} list)+{reset}",
+        f"--bind=r:reload({me} list)+{reset}",
+        f"--bind=?:transform:{me} keys-toggle",
+        f"--bind=/:show-input+unbind({keys})+{reset}",
+        f"--bind=esc:transform:[[ $FZF_INPUT_STATE == hidden ]] && echo abort || echo '{normal}'",
+        *extra,
+    ], input=listing, text=True)
+
+
+def main(argv):
+    cmd, args = (argv[0] if argv else ""), argv[1:]
+    if cmd == "hook":
+        try:
+            hook()
+        except Exception as e:  # never break Claude; leave a trace instead
+            with open(STATE / "errors.log", "a") as f:
+                f.write(f"{datetime.now().isoformat()} {type(e).__name__}: {e}\n")
+    elif cmd == "list":
+        list_reports()
+    elif cmd in ("show", "open", "resume", "delete", "toggle") and len(args) == 1:
+        sid = args[0]
+        if sid == "-":
+            return
+        {"show": show, "open": open_report, "resume": resume, "toggle": toggle,
+         "delete": lambda i: (load(i), remove(i), refresh_status())}[cmd](sid)
+    elif cmd == "read-all":
+        for m in reports():
+            set_unread(m, False)
+        refresh_status()
+    elif cmd == "count":
+        count("--tmux" in args)
+    elif cmd == "keys-toggle":
+        keys_toggle()
+    elif cmd == "serve":
+        serve()
+    elif cmd == "":
+        ui()
+    else:
+        sys.exit(__doc__.split("\n\n")[1])
+
+
+if __name__ == "__main__":
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    main(sys.argv[1:])

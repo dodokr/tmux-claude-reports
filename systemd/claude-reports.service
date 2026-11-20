@@ -1,0 +1,8 @@
+[Unit]
+Description=claude-reports: report pages and their buttons
+Requires=claude-reports.socket
+
+[Service]
+# Started by the socket on the first request; exits by itself after 30 idle minutes.
+ExecStart=%h/.local/bin/claude-reports serve
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin

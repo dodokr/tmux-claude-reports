@@ -1,0 +1,8 @@
+[Unit]
+Description=claude-reports: listen for the report pages (127.0.0.1 only)
+
+[Socket]
+ListenStream=127.0.0.1:47823
+
+[Install]
+WantedBy=sockets.target
