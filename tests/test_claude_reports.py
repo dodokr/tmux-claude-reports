@@ -173,6 +173,32 @@ class Parse(Env):
         self.assertEqual(s["final"], [])
         self.assertEqual(s["said"], "Starting.")
 
+    def test_rewound_branch_is_ignored(self):
+        def rec_(uid, parent, r):
+            return {**r, "uuid": uid, "parentUuid": parent}
+        s = cr.parse(self.transcript([
+            rec_("u1", None, prompt("first")), rec_("a1", "u1", say("first answer")),
+            rec_("u2", "a1", prompt("abandoned")), rec_("a2", "u2", say("abandoned answer")),
+            # rewound to a1: the new prompt hangs off the first answer
+            rec_("u3", "a1", prompt("second")), rec_("a3", "u3", say("second answer")),
+        ]))
+        self.assertEqual(s["prompts"], ["first", "second"])
+        self.assertEqual(s["replies"], ["first answer"])
+        self.assertEqual(s["final"], ["second answer"])
+
+    def test_branch_continues_across_compact(self):
+        def rec_(uid, r, **links):
+            return {**r, "uuid": uid, **links}
+        s = cr.parse(self.transcript([
+            rec_("u1", prompt("before compact"), parentUuid=None),
+            rec_("a1", say("old answer"), parentUuid="u1"),
+            rec_("c1", rec("user", "summary", isCompactSummary=True), parentUuid=None,
+                 logicalParentUuid="a1"),
+            rec_("u2", prompt("after compact"), parentUuid="c1"),
+            rec_("a2", say("new answer"), parentUuid="u2"),
+        ]))
+        self.assertEqual(s["prompts"], ["before compact", "after compact"])
+
     def test_interrupted(self):
         s = cr.parse(self.transcript([prompt("go"), say("Hm"),
                                       prompt("[Request interrupted by user]")]))
@@ -416,6 +442,26 @@ class Commands(Env):
         out = self.run_cr("keys-toggle", env={"FZF_HEADER_LABEL": " keys "}).stdout
         self.assertEqual(out.strip(), "change-header-label()+change-header:"
                                       "Enter open · c go to session · dd delete · ? more")
+
+    def test_open_pane_opens_that_sessions_report(self):
+        self.mark_open("aaaa")
+        r = self.run_cr("open-pane", "%7")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for _ in range(50):
+            if "browser" in self.calls():
+                break
+            time.sleep(0.05)
+        self.assertIn(f"/r/aaaa?t=", self.calls())
+
+    def test_open_pane_without_session_or_report_says_so(self):
+        r = self.run_cr("open-pane", "%9")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("display-message claude-reports: no Claude session in this pane", self.calls())
+        self.mark_open("cccc", pane="9")  # a session that hasn't finished a reply yet
+        self.run_cr("open-pane", "%9")
+        self.assertIn("no report yet", self.calls())
+        self.assertNotIn("browser", self.calls())
+        self.assertIn("bad pane", self.run_cr("open-pane", "../x").stderr)
 
     def test_rejects_bad_ids(self):
         for cmd in ("show", "open", "delete", "resume", "toggle"):

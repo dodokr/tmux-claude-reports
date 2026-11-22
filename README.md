@@ -56,6 +56,11 @@ can stay open or not: when you are done with it, `/exit` frees its RAM and the r
   the state that [tmux-claude-tasks](https://github.com/dodokr/tmux-claude-tasks) keeps. Closed
   ones show `closed`.
 - **Unread count in the tmux status line**, refreshed the moment a report is written.
+- **`prefix e` in a Claude pane** opens that session's report in the browser directly, without
+  the picker. It needs tmux-claude-tasks, which records which session runs in which pane.
+- **Rewinds are handled.** A rewind keeps the old messages in the transcript and branches off
+  an earlier one. Reports follow only the current branch: the newest message's chain of
+  parents, across `/compact`. Prompts you rewound away don't show up.
 - Reports older than 14 days are pruned.
 
 ## Requirements
@@ -90,6 +95,8 @@ Then in `tmux.conf`:
 
 ```tmux
 bind C-e display-popup -E -w 90% -h 85% "~/.local/bin/claude-reports"
+# From a pane running Claude: open that session's report straight away.
+bind e run-shell -b "~/.local/bin/claude-reports open-pane '#{pane_id}'"
 set -g focus-events on   # lets a reply you watched count as read
 set -ag status-right "#(~/.local/bin/claude-reports count --tmux)"
 ```
