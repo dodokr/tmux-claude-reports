@@ -58,6 +58,9 @@ can stay open or not: when you are done with it, `/exit` frees its RAM and the r
 - **Unread count in the tmux status line**, refreshed the moment a report is written.
 - **`prefix e` in a Claude pane** opens that session's report in the browser directly, without
   the picker. It needs tmux-claude-tasks, which records which session runs in which pane.
+- **One tab per report** with the optional Chrome extension in `chrome-extension/`. Opening a
+  report that is already open, in any window, switches to that tab and reloads it, instead
+  of opening a duplicate. See [Chrome extension](#chrome-extension).
 - **Rewinds are handled.** A rewind keeps the old messages in the transcript and branches off
   an earlier one. Reports follow only the current branch: the newest message's chain of
   parents, across `/compact`. Prompts you rewound away don't show up.
@@ -111,6 +114,17 @@ systemctl --user enable --now claude-reports.socket
 
 For Chrome to come to the front when a report opens, KWin must let it raise itself. Add a
 window rule for the window class `google-chrome` with "Focus stealing prevention: None".
+
+### Chrome extension
+
+Optional. Without it, every open makes a new tab.
+
+1. Open `chrome://extensions` and switch on **Developer mode** (top right).
+2. Click **Load unpacked** and pick the `chrome-extension/` folder of this repo.
+
+It only has access to `http://127.0.0.1:47823/*`, so Chrome shows it the URLs of report tabs
+and no others. It makes no network requests. If you change the port, change it in
+`manifest.json` and `background.js` too.
 
 ## Keys
 

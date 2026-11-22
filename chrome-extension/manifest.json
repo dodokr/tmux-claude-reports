@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "claude-reports: one tab per report",
+  "version": "1.0",
+  "description": "When a claude-reports page opens in a new tab and another tab already shows it, switch to that tab instead.",
+  "host_permissions": ["http://127.0.0.1:47823/*", "http://localhost:47823/*"],
+  "background": { "service_worker": "background.js" }
+}
