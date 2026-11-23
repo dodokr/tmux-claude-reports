@@ -129,6 +129,8 @@ def parse(path):
             s["titles"]["ai"] = r["aiTitle"]
         elif kind == "summary" and r.get("summary"):
             s["titles"].setdefault("ai", r["summary"])
+        elif kind == "attachment":
+            queued(s, r, active)
         if kind not in ("user", "assistant") or not isinstance(r.get("message"), dict):
             continue
         if any(r.get(k) for k in ("isSidechain", "isMeta", "isCompactSummary",
@@ -181,6 +183,31 @@ def parse(path):
                     s["final"].append(t)
                     s["said"] = t  # last text of the turn, even if tool calls followed
     return s
+
+
+QUEUED = "\n\n↳ Sent while Claude was working:\n\n"
+
+
+def queued(s, r, active):
+    """A message you typed while Claude was busy, which it read mid-turn.
+
+    Claude Code doesn't record it as a user message but as an attachment that it injects
+    into the running turn. It belongs to the current prompt: the turn's reply answers both.
+    """
+    a = r.get("attachment")
+    if not (isinstance(a, dict) and a.get("type") == "queued_command"
+            and a.get("commandMode") == "prompt"
+            and isinstance(a.get("origin"), dict) and a["origin"].get("kind") == "human"):
+        return  # also task notifications and messages from other sessions
+    if r.get("isSidechain") or (active and r.get("uuid") and r["uuid"] not in active):
+        return
+    text, is_command = clean_prompt(CONTROL.sub("", text_of(a.get("prompt"))))
+    if not text or is_command:
+        return
+    if s["prompts"]:
+        s["prompts"][-1] += QUEUED + text
+    else:
+        s["prompts"].append(text)
 
 
 def active_branch(records):
@@ -360,7 +387,8 @@ def build(sid, s, info, ended, last_message=None, background=0):
         # Plain markdown for the terminal preview; the browser page shows these collapsed.
         md += [EARLIER, ""]
         for t in turns:
-            md += [f"### {t['n']}. {clip(' '.join(t['prompt'].split()), 150)}", "",
+            head = t["prompt"].split(QUEUED)[0]
+            md += [f"### {t['n']}. {clip(' '.join(head.split()), 150)}", "",
                    clip(t["reply"], 1500) if t["reply"] else "*(no reply)*", ""]
         hidden = len(s["prompts"]) - 1 - len(turns)
         if hidden:
@@ -800,7 +828,7 @@ if (turns.length) {
     const n = document.createElement('span');
     n.className = 'n';
     n.textContent = t.n + '.';
-    const one = t.prompt.replace(/\\s+/g, ' ').trim();
+    const one = t.prompt.split('\\n\\n↳ ')[0].replace(/\\s+/g, ' ').trim();
     sum.append(n, one.length > 140 ? one.slice(0, 139) + '…' : one);
     const q = document.createElement('blockquote');
     q.textContent = t.prompt;

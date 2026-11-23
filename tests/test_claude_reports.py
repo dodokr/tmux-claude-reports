@@ -147,6 +147,29 @@ class Parse(Env):
         self.assertEqual(list(s["files"]), ["/home/u/proj/a.py"])
         self.assertFalse(s["pending_tool"] or s["interrupted"])
 
+    def test_message_queued_mid_turn_joins_the_prompt(self):
+        def attach(text, kind="human", mode="prompt"):
+            return {"type": "attachment", "attachment": {
+                "type": "queued_command", "prompt": text, "commandMode": mode,
+                "origin": {"kind": kind}}, "timestamp": "2026-11-20T10:00:30.000Z"}
+        self.hook([
+            prompt("first question"), say("first answer"),
+            prompt("fix it"),
+            tool("Edit", file_path="/home/u/proj/a.py"),
+            attach("also update the docs"),
+            attach("<task-notification>done</task-notification>",
+                   kind="task-notification", mode="task-notification"),
+            attach("from another session", kind="peer"),
+            result(),
+            say("Fixed it and updated the docs."),
+        ])
+        md = self.md()
+        self.assertIn("> fix it", md)
+        self.assertIn("also update the docs", md)
+        self.assertNotIn("task-notification", md)
+        self.assertNotIn("another session", md)
+        self.assertEqual(self.meta()["prompts"], 2)
+
     def test_noise_is_not_a_prompt(self):
         s = cr.parse(self.transcript([
             prompt("<command-name>/effort</command-name><command-args></command-args>"),
