@@ -125,12 +125,12 @@ esac
     def calls(self):
         return self.log.read_text() if self.log.exists() else ""
 
-    def mark_open(self, sid=SID, pane="7"):
+    def mark_open(self, sid=SID, pane="7", status="done", since=0):
         """Record the session as open in a pane, the way claude-tasks does (a live process)."""
         pid = os.getpid()
         stat = Path(f"/proc/{pid}/stat").read_text()
         start = stat[stat.rindex(")") + 2:].split()[19]
-        (self.tasks / pane).write_text(f"running\t0\t/home/u/proj\t{sid}\t{pid} {start}\n")
+        (self.tasks / pane).write_text(f"{status}\t{since}\t/home/u/proj\t{sid}\t{pid} {start}\n")
 
 
 class Parse(Env):
@@ -453,6 +453,22 @@ class Commands(Env):
         self.assertIn("▶ work:2.1", rows["aaaa"])
         self.assertIn("closed", rows["bbbb"])
 
+    def test_list_and_preview_show_a_busy_session(self):
+        self.mark_open("aaaa", status="running", since=1795390000)
+        rows = dict(line.split("\t", 1) for line in self.run_cr("list").stdout.splitlines())
+        self.assertIn("◐ work:2.1", rows["aaaa"])
+        self.assertTrue(self.run_cr("show", "aaaa").stdout.startswith("> **Working again**"))
+        self.transcript([prompt("older"), say("a"), prompt("and the tests too")], sid="aaaa")
+        out = self.run_cr("show", "aaaa").stdout
+        self.assertTrue(out.startswith("> **Working on your new message**"), out)
+        self.assertIn("> and the tests too\n", out)
+        self.mark_open("aaaa", status="waiting")
+        rows = dict(line.split("\t", 1) for line in self.run_cr("list").stdout.splitlines())
+        self.assertIn("? work:2.1", rows["aaaa"])
+        self.assertIn("**Waiting for you in the pane**", self.run_cr("show", "aaaa").stdout)
+        self.mark_open("aaaa", status="done")
+        self.assertTrue(self.run_cr("show", "aaaa").stdout.startswith("# "))
+
     def test_delete(self):
         self.assertTrue((self.state / "aaaa.turns.json").exists())
         self.run_cr("delete", "aaaa")
@@ -558,6 +574,9 @@ class Server(Env):
         c.close()
         return r.status, dict(r.getheaders()), body
 
+    def auth(self):
+        return {"Cookie": self.cookie, "X-Claude-Reports": self.token}
+
     def post(self, action, sid=SID, **override):
         h = {"Origin": self.origin, "Cookie": self.cookie, "X-Claude-Reports": self.token}
         h.update({k.replace("_", "-"): v for k, v in override.items()})
@@ -622,9 +641,23 @@ class Server(Env):
         status, body = self.post("read")
         self.assertEqual(status, 200)
         self.assertEqual(body["state"], {"id": SID, "unread": False, "open": False, "target": "",
-                                         "version": self.meta()["ended"]})
+                                         "version": self.meta()["ended"], "busy": "",
+                                         "since": 0, "prompt": ""})
         self.assertFalse(self.meta()["unread"])
         self.assertTrue(self.post("unread")[1]["state"]["unread"])
+
+    def test_state_shows_the_message_claude_is_working_on(self):
+        recs = [prompt("first"), say("answer")]
+        self.mark_open(SID, status="running", since=1795390000)
+        state = lambda: json.loads(self.req("GET", f"/api/state/{SID}", self.auth())[2])["state"]
+        s = state()  # running, but no new prompt yet (e.g. woken by a background task)
+        self.assertEqual((s["busy"], s["since"], s["prompt"]), ("running", 1795390000, ""))
+        self.transcript(recs + [prompt("now the second thing")])
+        self.assertEqual(state()["prompt"], "now the second thing")
+        self.mark_open(SID, status="waiting")
+        self.assertEqual(state()["busy"], "waiting")
+        self.mark_open(SID, status="done")
+        self.assertEqual((state()["busy"], state()["prompt"]), ("", ""))
 
     def test_state_needs_cookie_and_header(self):
         self.assertEqual(self.req("GET", f"/api/state/{SID}", {"Cookie": self.cookie})[0], 403)

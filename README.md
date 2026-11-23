@@ -38,6 +38,10 @@ can stay open or not: when you are done with it, `/exit` frees its RAM and the r
   - **New reply · Reload** appears when Claude has replied again since you loaded the page.
     The page checks when you switch back to the tab and every 5 s while it is visible. It
     doesn't reload by itself, so your scroll position stays put.
+  - **Working on your new message** appears while Claude works on a prompt you sent after
+    the report was written, with the prompt's text and the time you sent it. **Waiting for
+    you in the pane** appears when Claude is stuck on a permission prompt or a question. The
+    report itself still shows the last finished turn until the new reply arrives.
 
   The pages come from a small server on `127.0.0.1` (see [Safety](#safety)). systemd starts it
   on the first request and it exits after 30 idle minutes, so nothing runs while you aren't
@@ -53,8 +57,11 @@ can stay open or not: when you are done with it, `/exit` frees its RAM and the r
   jumps to the pane if the session is still open and resumes it in a new tmux window if not.
   Without it, the session is always resumed in a new window.
 - **Open sessions are marked in the picker** with `▶` and their current tmux target, using
-  the state that [tmux-claude-tasks](https://github.com/dodokr/tmux-claude-tasks) keeps. Closed
-  ones show `closed`.
+  the state that [tmux-claude-tasks](https://github.com/dodokr/tmux-claude-tasks) keeps: `◐`
+  while Claude is working, `?` while it waits for you. Closed ones show `closed`. The preview
+  of a busy session starts with the prompt it is working on.
+- **Messages you queue** while Claude is working are part of that turn's prompt, under
+  "Sent while Claude was working".
 - **Unread count in the tmux status line**, refreshed the moment a report is written.
 - **`prefix e` in a Claude pane** opens that session's report in the browser directly, without
   the picker. It needs tmux-claude-tasks, which records which session runs in which pane.

@@ -458,6 +458,7 @@ def hook():
                      len(bg) if isinstance(bg, list) else 0)
     write_atomic(STATE / f"{sid}.md", md)
     write_atomic(STATE / f"{sid}.turns.json", json.dumps(earlier_turns(s), ensure_ascii=False))
+    meta["transcript"] = os.path.abspath(transcript)
     write_atomic(STATE / f"{sid}.json", json.dumps(meta, ensure_ascii=False, indent=1))
     (STATE / "html" / f"{sid}.html").unlink(missing_ok=True)
     prune()
@@ -530,7 +531,11 @@ def started(pids):
 
 
 def live_sessions():
-    """{session id: (pane id, "session:window.pane")} for sessions open in a tmux pane."""
+    """{session id: (pane id, "session:window.pane", status, since)} for sessions open in tmux.
+
+    status and since (epoch seconds) are claude-tasks' state of the pane: "running" after you
+    send a prompt, "waiting" on a permission prompt or question, "done" after a reply.
+    """
     try:
         files = list(TASKS.iterdir())
     except OSError:
@@ -548,8 +553,10 @@ def live_sessions():
             continue
         pane = "%" + f.name
         if len(fields) >= 4 and fields[3] and pane in panes:
-            entries.append((fields[3], pane, fields[4] if len(fields) > 4 else ""))
-    alive = started({p for _, _, proc in entries if (p := proc.split(" ", 1)[0]).isdigit()})
+            since = int(fields[1]) if fields[1].isdigit() else 0
+            entries.append((fields[3], pane, fields[4] if len(fields) > 4 else "",
+                            fields[0], since))
+    alive = started({p for _, _, proc, *_ in entries if (p := proc.split(" ", 1)[0]).isdigit()})
     alive_pids = {a.split(" ", 1)[0] for a in alive}
 
     def running(proc):
@@ -558,7 +565,66 @@ def live_sessions():
         # recorded by an older claude-tasks as "pid weekday month day time year": pid only
         return proc.count(" ") > 1 and proc.split(" ", 1)[0] in alive_pids
 
-    return {sid: (pane, panes[pane]) for sid, pane, proc in entries if running(proc)}
+    return {sid: (pane, panes[pane], status, since)
+            for sid, pane, proc, status, since in entries if running(proc)}
+
+
+def transcript_of(meta):
+    p = meta.get("transcript")
+    if p and os.path.isfile(p):
+        return p
+    # Reports written before the path was recorded.
+    projects = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    return next((str(f) for f in projects.glob(f"*/{meta['id']}.jsonl")), None)
+
+
+_prompts_cache = {}
+
+
+def latest_prompts(path):
+    """parse(path)["prompts"], cached on mtime and size: the page asks every 5 s."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _prompts_cache.get(path)
+    if not hit or hit[0] != key:
+        hit = _prompts_cache[path] = (key, parse(path)["prompts"])
+    return hit[1]
+
+
+def busy(meta, live):
+    """What the session is doing since the report was written: {"busy", "since", "prompt"}.
+
+    busy is "running", "waiting" or "". prompt is the message Claude is working on if you sent
+    a new one since the report (empty when it carries on by itself, e.g. after a background
+    task finished).
+    """
+    entry = live.get(meta["id"])
+    if not entry or entry[2] not in ("running", "waiting"):
+        return {"busy": "", "since": 0, "prompt": ""}
+    prompt = ""
+    path = transcript_of(meta)
+    if path:
+        prompts = latest_prompts(path)
+        if len(prompts) > meta.get("prompts", 0):
+            prompt = prompts[-1].split(QUEUED)[0].strip()
+    return {"busy": entry[2], "since": entry[3], "prompt": clip(prompt, 2000)}
+
+
+def busy_note(b):
+    """One markdown line for the terminal preview, or ""."""
+    if not b["busy"]:
+        return ""
+    since = datetime.fromtimestamp(b["since"]).strftime("%H:%M") if b["since"] else ""
+    head = ("**Waiting for you in the pane** (permission prompt or question)"
+            if b["busy"] == "waiting" else
+            "**Working on your new message**" if b["prompt"] else "**Working again**")
+    line = head + (f" · since {since}" if since else "")
+    if b["prompt"]:
+        line += "\n>\n" + quote(clip(" ".join(b["prompt"].split()), 300))
+    return "> " + line + "\n\n"
 
 
 def list_reports():
@@ -568,15 +634,20 @@ def list_reports():
         if m.get("unfinished"):
             icon, color = ("!", "31") if m.get("unread") else ("!", "90")
         folder = os.path.basename((m.get("cwd") or "").rstrip("/")) or "?"
-        where = f"\x1b[36m▶ {fit(live[m['id']][1], 18)}\x1b[0m" if m["id"] in live \
-            else f"\x1b[90m  {fit('closed', 18)}\x1b[0m"
+        if m["id"] in live:
+            _, target, status, _ = live[m["id"]]
+            mark, c = {"running": ("◐", "33"), "waiting": ("?", "31")}.get(status, ("▶", "36"))
+            where = f"\x1b[{c}m{mark} {fit(target, 18)}\x1b[0m"
+        else:
+            where = f"\x1b[90m  {fit('closed', 18)}\x1b[0m"
         print(f"{m['id']}\t\x1b[{color}m{icon}\x1b[0m {fit(m.get('title', ''), 38)}  {where} "
               f"\x1b[90m{fit(folder, 14)} {ago(m.get('ended', 0)):>4}\x1b[0m")
 
 
 def show(sid):
-    load(sid)
-    sys.stdout.write((STATE / f"{sid}.md").read_text(encoding="utf-8"))
+    meta = load(sid)
+    note = busy_note(busy(meta, live_sessions())) if meta else ""
+    sys.stdout.write(note + (STATE / f"{sid}.md").read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------- tmux, Konsole, KWin
@@ -727,7 +798,8 @@ def state_of(meta, live=None):
     live = live_sessions() if live is None else live
     pane = live.get(meta["id"])
     return {"id": meta["id"], "unread": bool(meta.get("unread")), "open": bool(pane),
-            "target": pane[1] if pane else "", "version": meta.get("ended", 0)}
+            "target": pane[1] if pane else "", "version": meta.get("ended", 0),
+            **busy(meta, live)}
 
 
 def act(action, sid):
@@ -762,7 +834,7 @@ def act(action, sid):
         # kill whatever runs in that pane now.
         if sid not in live:
             return 409, "the session isn't open in tmux anymore"
-        pane, target = live[sid]
+        pane, target, *_ = live[sid]
         tmux("kill-pane", "-t", pane)
         set_unread(meta, False)
         refresh_status()
@@ -787,6 +859,23 @@ body { margin: 0; background: #fff; }
 .markdown-body details.turn > summary { cursor: pointer; padding: 10px 0; font-weight: 600; }
 .markdown-body details.turn > summary .n { color: var(--muted); font-weight: 400; margin-right: 6px; }
 .markdown-body details.turn blockquote { white-space: pre-wrap; }
+.markdown-body details.asked { border: 1px solid var(--line); border-radius: 6px; padding: 0 16px; margin: 0 0 16px; }
+.markdown-body details.asked > summary { cursor: pointer; padding: 10px 0; color: var(--muted); }
+.markdown-body details.asked > summary .n { margin-left: 10px; font-size: 85%; opacity: .8; }
+.markdown-body details.asked[open] > summary .n { display: none; }
+.bar .busy { display: none; max-width: 960px; margin: 0 auto; padding: 0 24px 8px; box-sizing: border-box; }
+.bar .busy.on { display: block; }
+.bar .busy b { color: #9a6700; }
+.bar .busy b::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                       background: currentColor; margin-right: 7px; vertical-align: 1px;
+                       animation: pulse 1.6s ease-in-out infinite; }
+.bar .busy.waiting b::before { animation: none; }
+@keyframes pulse { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .bar .busy b::before { animation: none; } }
+.bar .busy.waiting b { color: var(--danger); }
+.bar .busy q { display: block; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar .busy q::before, .bar .busy q::after { content: none; }
+@media (prefers-color-scheme: dark) { .bar .busy b { color: #d29922; } }
 .bar .newer { display: none; color: #1f6feb; font-weight: 600; }
 .bar .newer.on { display: inline-block; }
 .bar { position: sticky; top: 0; z-index: 1; background: var(--bar); border-bottom: 1px solid var(--line);
@@ -814,6 +903,30 @@ const md = window.markdownit({ html: false, linkify: true, highlight: (str, lang
 }});
 const article = document.querySelector('.markdown-body');
 article.innerHTML = md.render(src);
+// Prompts collapsed to their first line: pasted logs or documents can be pages long.
+function collapsed(q) {
+  const text = q.textContent.trim();
+  const first = text.split('\\n')[0].replace(/\\s+/g, ' ').trim();
+  if (first === text && first.length <= 160) return q;  // nothing hidden, nothing to expand
+  const d = document.createElement('details');
+  d.className = 'asked';
+  const sum = document.createElement('summary');
+  sum.textContent = first.length > 160 ? first.slice(0, 159) + '…' : first;
+  const more = document.createElement('span');
+  more.className = 'n';
+  more.textContent = text.length.toLocaleString() + ' characters';
+  sum.append(more);
+  d.append(sum, q);
+  return d;
+}
+for (const h of article.querySelectorAll('h2')) {
+  const q = h.nextElementSibling;
+  if (h.textContent !== 'Asked' || !q || q.tagName !== 'BLOCKQUOTE') continue;
+  const marker = document.createComment('');
+  q.replaceWith(marker);
+  marker.replaceWith(collapsed(q));
+  break;
+}
 // Earlier turns, collapsed. Prompts go in as text, replies through markdown-it (html: false).
 const turnsEl = document.getElementById('turns');
 const turns = turnsEl ? JSON.parse(turnsEl.textContent) : [];
@@ -834,7 +947,7 @@ if (turns.length) {
     q.textContent = t.prompt;
     const r = document.createElement('div');
     r.innerHTML = t.reply ? md.render(t.reply) : '<p><em>(no reply)</em></p>';
-    d.append(sum, q, r);
+    d.append(sum, collapsed(q), r);
     article.appendChild(d);
   }
 }
@@ -845,7 +958,8 @@ BAR_HTML = """<div class="bar"><div class="bar-in">
 <button id="read">Mark read</button>
 <button id="kill" class="danger" title="Kill the Claude session and close its tmux pane">Kill session</button>
 <button id="newer" class="newer" title="Claude replied again since this page was loaded">New reply · Reload</button>
-<span class="status" id="status"></span></div></div>"""
+<span class="status" id="status"></span></div>
+<div class="busy" id="busy"><b id="busy-head"></b> <span id="busy-since"></span><q id="busy-prompt"></q></div></div>"""
 
 BAR_JS = """
 const ID = %s, TOKEN = %s, VERSION = %s;
@@ -859,6 +973,16 @@ function show(s, note) {
                             : 'The session is closed: resume it in a new tmux window';
   $('read').textContent = s.unread ? 'Mark read' : 'Mark unread';
   $('kill').disabled = !s.open;
+  // What the session is doing since this report: from claude-tasks, as text only.
+  $('busy').classList.toggle('on', !!s.busy);
+  $('busy').classList.toggle('waiting', s.busy === 'waiting');
+  $('busy-head').textContent = s.busy === 'waiting'
+    ? 'Waiting for you in the pane (permission prompt or question)'
+    : s.prompt ? 'Working on your new message' : 'Working again';
+  $('busy-since').textContent = s.since
+    ? '· since ' + new Date(s.since * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  $('busy-prompt').textContent = s.prompt || '';
+  $('busy-prompt').title = s.prompt || '';
   $('status').textContent = note || (s.open ? 'Open in ' + s.target : 'Session closed') +
                                     (s.unread ? ' · unread' : '');
 }
