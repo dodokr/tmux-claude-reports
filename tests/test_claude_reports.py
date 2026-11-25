@@ -148,10 +148,10 @@ class Parse(Env):
         self.assertFalse(s["pending_tool"] or s["interrupted"])
 
     def test_message_queued_mid_turn_joins_the_prompt(self):
-        def attach(text, kind="human", mode="prompt"):
+        def attach(text, kind="human", mode="prompt", **origin):
             return {"type": "attachment", "attachment": {
                 "type": "queued_command", "prompt": text, "commandMode": mode,
-                "origin": {"kind": kind}}, "timestamp": "2026-11-20T10:00:30.000Z"}
+                "origin": {"kind": kind, **origin}}, "timestamp": "2026-11-20T10:00:30.000Z"}
         self.hook([
             prompt("first question"), say("first answer"),
             prompt("fix it"),
@@ -159,7 +159,8 @@ class Parse(Env):
             attach("also update the docs"),
             attach("<task-notification>done</task-notification>",
                    kind="task-notification", mode="task-notification"),
-            attach("from another session", kind="peer"),
+            attach('<cross-session-message from-name="helper">tests pass</cross-session-message>',
+                   kind="peer", name="helper", body="tests pass"),
             result(),
             say("Fixed it and updated the docs."),
         ])
@@ -167,8 +168,29 @@ class Parse(Env):
         self.assertIn("> fix it", md)
         self.assertIn("also update the docs", md)
         self.assertNotIn("task-notification", md)
-        self.assertNotIn("another session", md)
+        self.assertIn("Message from session helper while Claude was working:", md)
+        self.assertIn("tests pass", md)
+        self.assertNotIn("cross-session-message", md)
         self.assertEqual(self.meta()["prompts"], 2)
+
+    def test_message_from_another_session_is_a_prompt(self):
+        raw = ('Another Claude session sent a message:\n<cross-session-message from="uds:/x.sock" '
+               'from-name="api-work">\nThe migration is done.\n</cross-session-message>')
+        self.hook([
+            prompt("ask api-work to migrate"), say("Sent."),
+            rec("user", raw, isMeta=True, origin={"kind": "peer", "name": "api-work",
+                                                   "body": "The migration is done."}),
+            say("api-work finished the migration."),
+            rec("user", "[Cross-session idle notice] api-work is idle now", isMeta=True),
+        ], last_assistant_message="api-work finished the migration.")
+        md = self.md()
+        self.assertIn("## Asked\n\n> Message from session api-work:\n>\n> The migration is done.", md)
+        self.assertIn("### 1. ask api-work to migrate", md)
+        self.assertNotIn("idle notice", md)
+        self.assertEqual(self.meta()["prompts"], 2)
+        # Without the parsed origin fields, the name and text come from the tag.
+        s = cr.parse(self.transcript([rec("user", raw, isMeta=True, origin={"kind": "peer"})]))
+        self.assertEqual(s["prompts"], ["Message from session api-work:\n\nThe migration is done."])
 
     def test_noise_is_not_a_prompt(self):
         s = cr.parse(self.transcript([

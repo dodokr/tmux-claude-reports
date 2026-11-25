@@ -133,8 +133,11 @@ def parse(path):
             queued(s, r, active)
         if kind not in ("user", "assistant") or not isinstance(r.get("message"), dict):
             continue
-        if any(r.get(k) for k in ("isSidechain", "isMeta", "isCompactSummary",
-                                  "isVisibleInTranscriptOnly", "isApiErrorMessage")):
+        origin = r.get("origin") if isinstance(r.get("origin"), dict) else {}
+        peer = kind == "user" and origin.get("kind") == "peer"
+        # A message from another session is marked meta, but it is the turn's prompt.
+        if any(r.get(k) for k in ("isSidechain", "isCompactSummary", "isVisibleInTranscriptOnly",
+                                  "isApiErrorMessage") + (() if peer else ("isMeta",))):
             continue
         if active and r.get("uuid") and r["uuid"] not in active:
             continue  # on a branch that a rewind abandoned
@@ -145,8 +148,7 @@ def parse(path):
         s["entrypoint"] = s["entrypoint"] or r.get("entrypoint")
         content = r["message"].get("content")
         if kind == "user":
-            origin = r.get("origin")
-            if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+            if origin.get("kind") not in (None, "human", "peer"):
                 continue
             if isinstance(content, list) and any(
                     isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
@@ -156,7 +158,7 @@ def parse(path):
             if INTERRUPTED.match(raw):
                 s["interrupted"] = True
                 continue
-            text, is_command = clean_prompt(raw)
+            text, is_command = (peer_text(origin, raw), False) if peer else clean_prompt(raw)
             if text and not is_command:
                 if s["prompts"]:  # close the previous turn: keep what Claude answered
                     s["replies"].append("\n\n".join(s["final"]) or s["said"])
@@ -185,7 +187,20 @@ def parse(path):
     return s
 
 
-QUEUED = "\n\n↳ Sent while Claude was working:\n\n"
+SEP = "\n\n↳ "  # between a turn's prompt and messages that came in while Claude worked on it
+QUEUED = SEP + "Sent while Claude was working:\n\n"
+PEER_TAG = re.compile(r"</?cross-session-message\b[^>]*>")
+
+
+def peer_text(origin, raw):
+    """A message another Claude session sent, as a prompt: who sent it, then what it says."""
+    name = origin.get("name")
+    if not name and (m := re.search(r'from-name="([^"]*)"', raw)):
+        name = html.unescape(m.group(1))
+    body = origin.get("body")
+    if not isinstance(body, str) or not body.strip():
+        body = PEER_TAG.sub("", raw.split("\n", 1)[1] if raw.startswith("Another Claude") else raw)
+    return f"Message from session {name or '(unnamed)'}:\n\n{body.strip()}"
 
 
 def queued(s, r, active):
@@ -195,17 +210,24 @@ def queued(s, r, active):
     into the running turn. It belongs to the current prompt: the turn's reply answers both.
     """
     a = r.get("attachment")
+    origin = a.get("origin") if isinstance(a, dict) else None
     if not (isinstance(a, dict) and a.get("type") == "queued_command"
-            and a.get("commandMode") == "prompt"
-            and isinstance(a.get("origin"), dict) and a["origin"].get("kind") == "human"):
-        return  # also task notifications and messages from other sessions
+            and a.get("commandMode") == "prompt" and isinstance(origin, dict)
+            and origin.get("kind") in ("human", "peer")):
+        return  # e.g. task notifications
     if r.get("isSidechain") or (active and r.get("uuid") and r["uuid"] not in active):
         return
-    text, is_command = clean_prompt(CONTROL.sub("", text_of(a.get("prompt"))))
+    raw = CONTROL.sub("", text_of(a.get("prompt")))
+    if origin["kind"] == "peer":
+        text, is_command = peer_text(origin, raw), False
+        sep = SEP + text.replace(":\n\n", " while Claude was working:\n\n", 1)
+    else:
+        text, is_command = clean_prompt(raw)
+        sep = QUEUED + text
     if not text or is_command:
         return
     if s["prompts"]:
-        s["prompts"][-1] += QUEUED + text
+        s["prompts"][-1] += sep
     else:
         s["prompts"].append(text)
 
@@ -387,7 +409,7 @@ def build(sid, s, info, ended, last_message=None, background=0):
         # Plain markdown for the terminal preview; the browser page shows these collapsed.
         md += [EARLIER, ""]
         for t in turns:
-            head = t["prompt"].split(QUEUED)[0]
+            head = t["prompt"].split(SEP)[0]
             md += [f"### {t['n']}. {clip(' '.join(head.split()), 150)}", "",
                    clip(t["reply"], 1500) if t["reply"] else "*(no reply)*", ""]
         hidden = len(s["prompts"]) - 1 - len(turns)
@@ -609,7 +631,7 @@ def busy(meta, live):
     if path:
         prompts = latest_prompts(path)
         if len(prompts) > meta.get("prompts", 0):
-            prompt = prompts[-1].split(QUEUED)[0].strip()
+            prompt = prompts[-1].split(SEP)[0].strip()
     return {"busy": entry[2], "since": entry[3], "prompt": clip(prompt, 2000)}
 
 
