@@ -37,6 +37,7 @@ $CLAUDE_REPORTS_RESUME    resume command (default $CLAUDE_SESSIONS_RESUME, else
                           "claude --resume {id}"); used when claude-sessions is not installed
 """
 
+import base64
 import hmac
 import html
 import json
@@ -62,6 +63,8 @@ RESUME = (os.environ.get("CLAUDE_REPORTS_RESUME") or os.environ.get("CLAUDE_SESS
 PORT = int(os.environ.get("CLAUDE_REPORTS_PORT") or 47823)
 IDLE = float(os.environ.get("CLAUDE_REPORTS_IDLE") or 1800)
 TASKS = Path(os.environ.get("CLAUDE_TASKS_DIR") or XDG_STATE / "claude-tasks")
+CONFIG = Path(os.environ.get("CLAUDE_REPORTS_CONFIG")
+              or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "claude-reports")
 SELF = os.path.realpath(__file__)
 ID = re.compile(r"^[A-Za-z0-9-]+$")
 
@@ -332,6 +335,26 @@ def code(text):
     return f"{ticks}{pad}{text}{pad}{ticks}"
 
 
+def answer(s, last_message=None):
+    """(Claude's final reply to the latest prompt, whether the turn didn't finish)."""
+    final = "\n\n".join(s["final"])
+    if last_message and last_message.strip():
+        lm = last_message.strip()
+        # The transcript's version can hold more (several text blocks after the last tool
+        # call); use it when it ends with the same message.
+        if not (s["final"] and s["final"][-1].strip() == lm):
+            final = lm
+        return final, False
+    return final, bool(s["interrupted"] or s["pending_tool"] or not final)
+
+
+def page_of(s, last_message=None):
+    """What the browser page lays out itself: the latest prompt and the reply, unformatted."""
+    final, _ = answer(s, last_message)
+    return {"asked": clip(s["prompts"][-1], 50000) if s["prompts"] else "",
+            "report": final or s["said"], "said_only": not final and bool(s["said"])}
+
+
 def build(sid, s, info, ended, last_message=None, background=0):
     """(metadata dict, markdown) for a session's latest reply.
 
@@ -345,16 +368,7 @@ def build(sid, s, info, ended, last_message=None, background=0):
         if value and value.strip():
             title, title_kind = clip(value.strip(), 100), kind
             break
-    final = "\n\n".join(s["final"])
-    if last_message and last_message.strip():
-        lm = last_message.strip()
-        # The transcript's version can hold more (several text blocks after the last tool
-        # call); use it when it ends with the same message.
-        if not (s["final"] and s["final"][-1].strip() == lm):
-            final = lm
-        unfinished = False
-    else:
-        unfinished = s["interrupted"] or s["pending_tool"] or not final
+    final, unfinished = answer(s, last_message)
     cwd = s["cwd"] or ""
     start = local(s["started"])
     end = datetime.fromtimestamp(ended).astimezone()
@@ -404,7 +418,7 @@ def build(sid, s, info, ended, last_message=None, background=0):
         md += ["## Report", "", "*(no reply)*", ""]
     if files:
         md += ["## Files changed", ""] + [f"- {code(f)}" for f in files] + [""]
-    turns = earlier_turns(s)
+    turns = earlier_turns(s)[:MD_TURNS]
     if turns:
         # Plain markdown for the terminal preview; the browser page shows these collapsed.
         md += [EARLIER, ""]
@@ -419,7 +433,8 @@ def build(sid, s, info, ended, last_message=None, background=0):
 
 
 EARLIER = "## Earlier in this session"
-MAX_TURNS = 20
+MD_TURNS = 20     # in the markdown, which the terminal preview shows
+MAX_TURNS = 1000  # on the page, where each turn is one collapsed line
 
 
 def earlier_turns(s):
@@ -427,6 +442,28 @@ def earlier_turns(s):
     turns = [{"n": i + 1, "prompt": p, "reply": r}
              for i, (p, r) in enumerate(zip(s["prompts"][:-1], s["replies"]))]
     return turns[::-1][:MAX_TURNS]
+
+
+AVATAR_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                ".webp": "image/webp", ".gif": "image/gif"}
+
+
+def avatars():
+    """{"you": data URI, "claude": data URI} from CONFIG/avatar-you.* and avatar-claude.*.
+
+    Embedded in the page, so it needs no extra request. Small pictures only (≤ 256 KB).
+    """
+    out = {}
+    for who in ("you", "claude"):
+        for ext, mime in AVATAR_TYPES.items():
+            f = CONFIG / f"avatar-{who}{ext}"
+            try:
+                if f.is_file() and f.stat().st_size <= 256 * 1024:
+                    out[who] = f"data:{mime};base64," + base64.b64encode(f.read_bytes()).decode()
+                    break
+            except OSError:
+                pass
+    return out
 
 
 def write_atomic(path, text):
@@ -439,18 +476,18 @@ def prune():
     cutoff = time.time() - KEEP_DAYS * 86400
     for f in STATE.glob("*.json"):
         if "." in f.stem:
-            continue  # <id>.turns.json goes with its report
+            continue  # <id>.turns.json and <id>.page.json go with their report
         meta = find(f.stem)
         if meta is None or meta.get("ended", 0) < cutoff:
             remove(f.stem)
-    for f in STATE.glob("*.turns.json"):  # orphans
-        if not (STATE / f"{f.name[:-len('.turns.json')]}.json").exists():
+    for f in [*STATE.glob("*.turns.json"), *STATE.glob("*.page.json")]:  # orphans
+        if not (STATE / f"{f.name.split('.', 1)[0]}.json").exists():
             f.unlink(missing_ok=True)
 
 
 def remove(sid):
     for p in (STATE / f"{sid}.json", STATE / f"{sid}.md", STATE / f"{sid}.turns.json",
-              STATE / "html" / f"{sid}.html"):
+              STATE / f"{sid}.page.json", STATE / "html" / f"{sid}.html"):
         p.unlink(missing_ok=True)
 
 
@@ -480,6 +517,8 @@ def hook():
                      len(bg) if isinstance(bg, list) else 0)
     write_atomic(STATE / f"{sid}.md", md)
     write_atomic(STATE / f"{sid}.turns.json", json.dumps(earlier_turns(s), ensure_ascii=False))
+    write_atomic(STATE / f"{sid}.page.json",
+                 json.dumps(page_of(s, data.get("last_assistant_message")), ensure_ascii=False))
     meta["transcript"] = os.path.abspath(transcript)
     write_atomic(STATE / f"{sid}.json", json.dumps(meta, ensure_ascii=False, indent=1))
     (STATE / "html" / f"{sid}.html").unlink(missing_ok=True)
@@ -866,158 +905,481 @@ def act(action, sid):
 
 # ---------------------------------------------------------------- HTML
 
-PAGE_CSS = """
-:root { color-scheme: light dark; --bar: #f6f8fa; --line: #d0d7de; --fg: #1f2328; --muted: #59636e;
-        --btn: #fff; --btn-hover: #eef1f4; --danger: #cf222e; }
-@media (prefers-color-scheme: dark) {
-  :root { --bar: #161b22; --line: #30363d; --fg: #e6edf3; --muted: #9198a1;
-          --btn: #21262d; --btn-hover: #30363d; --danger: #f85149; } }
-body { margin: 0; background: #fff; }
-@media (prefers-color-scheme: dark) { body { background: #0d1117; } }
-.markdown-body { box-sizing: border-box; max-width: 960px; margin: 0 auto; padding: 32px 24px 64px; }
-.markdown-body > table:first-of-type thead { display: none; }
-.markdown-body > table:first-of-type td:first-child { white-space: nowrap; }
-.markdown-body details.turn { border: 1px solid var(--line); border-radius: 6px; padding: 0 16px; margin: 0 0 8px; }
-.markdown-body details.turn > summary { cursor: pointer; padding: 10px 0; font-weight: 600; }
-.markdown-body details.turn > summary .n { color: var(--muted); font-weight: 400; margin-right: 6px; }
-.markdown-body details.turn blockquote { white-space: pre-wrap; }
-.markdown-body details.asked { border: 1px solid var(--line); border-radius: 6px; padding: 0 16px; margin: 0 0 16px; }
-.markdown-body details.asked > summary { cursor: pointer; padding: 10px 0; color: var(--muted); }
-.markdown-body details.asked > summary .n { margin-left: 10px; font-size: 85%; opacity: .8; }
-.markdown-body details.asked[open] > summary .n { display: none; }
-.bar .busy { display: none; max-width: 960px; margin: 0 auto; padding: 0 24px 8px; box-sizing: border-box; }
-.bar .busy.on { display: block; }
-.bar .busy b { color: #9a6700; }
-.bar .busy b::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-                       background: currentColor; margin-right: 7px; vertical-align: 1px;
-                       animation: pulse 1.6s ease-in-out infinite; }
-.bar .busy.waiting b::before { animation: none; }
+PAGE_CSS = r"""
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfc; --panel: #f4f5f7; --panel-2: #eceef1; --line: #e6e7eb; --line-2: #d8dade;
+  --fg: #1c1d21; --fg-2: #3d4048; --muted: #6b6f78; --faint: #9b9fa8;
+  --accent: #5e6ad2; --accent-bg: rgba(94, 106, 210, .10);
+  --green: #2f9e5f; --amber: #b9770e; --red: #d64545; --blue: #3f7bd9;
+  --sans: "Inter Variable", "Inter", ui-sans-serif, system-ui, "Noto Sans", sans-serif;
+  --mono: "JetBrains Mono", "Noto Sans Mono", ui-monospace, "SFMono-Regular", monospace;
+}
+@media (prefers-color-scheme: dark) { :root {
+  --bg: #0f1012; --panel: #17181b; --panel-2: #1e2024; --line: #25272c; --line-2: #31333a;
+  --fg: #e4e5e9; --fg-2: #c9cbd1; --muted: #8b8f99; --faint: #62666e;
+  --accent: #848ce6; --accent-bg: rgba(132, 140, 230, .14);
+  --green: #4cb782; --amber: #e0a43c; --red: #eb5757; --blue: #6c9be9; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 var(--sans);
+       -webkit-font-smoothing: antialiased; font-feature-settings: "cv11", "ss01"; }
+svg.i { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.4;
+        stroke-linecap: round; stroke-linejoin: round; }
+button { font: 500 13px/1 var(--sans); color: var(--fg-2); background: var(--panel); height: 28px;
+         padding: 0 11px; border: 1px solid var(--line-2); border-radius: 6px; cursor: pointer;
+         display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+button:hover:not(:disabled) { background: var(--panel-2); color: var(--fg); }
+button:disabled { opacity: .4; cursor: default; }
+button.danger { color: var(--red); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { background: var(--accent); color: #fff; filter: brightness(1.08); }
+button.ghost { background: none; border-color: transparent; color: var(--muted); }
+
+/* top bar */
+.top { position: sticky; top: 0; z-index: 5; height: 48px; border-bottom: 1px solid var(--line);
+       background: color-mix(in srgb, var(--bg) 82%, transparent); backdrop-filter: blur(10px); }
+.top-in { height: 100%; padding: 0 16px 0 20px; display: flex; align-items: center; gap: 8px; }
+.crumbs { display: flex; align-items: center; gap: 7px; min-width: 0; flex: 1; color: var(--muted); font-size: 13px; }
+.crumbs .app { display: inline-flex; align-items: center; gap: 7px; color: var(--fg-2); font-weight: 500; }
+.crumbs .app svg { color: var(--accent); }
+.crumbs .cur { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toast { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+         max-width: 40%; opacity: 0; transition: opacity .2s; }
+.toast.on { opacity: 1; }
+.actions { display: flex; gap: 6px; }
+#newer { display: none; } #newer.on { display: inline-flex; }
+
+/* page */
+.page { max-width: 780px; margin: 0 auto; padding: 44px 28px 120px; }
+h1.title { font-size: 26px; line-height: 1.25; font-weight: 600; letter-spacing: -.018em; margin: 0 0 14px; }
+.props { display: flex; flex-wrap: wrap; gap: 6px; }
+.prop { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 9px; font-size: 12.5px;
+        color: var(--fg-2); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.prop svg { color: var(--muted); }
+.prop.mono { font-family: var(--mono); font-size: 12px; }
+.prop .dot, .card .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
+.prop.status { color: var(--muted); } .prop.status.open { color: var(--green); }
+.prop.status.running, .card.running { color: var(--amber); } .prop.status.waiting, .card.waiting { color: var(--red); }
+.prop.status span, .card b { color: var(--fg); }
+.prop.unread { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 35%, var(--line)); }
+button.prop { font-weight: 400; } button.prop:hover { color: var(--fg); }
+.running .dot { animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .25; } }
-@media (prefers-reduced-motion: reduce) { .bar .busy b::before { animation: none; } }
-.bar .busy.waiting b { color: var(--danger); }
-.bar .busy q { display: block; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.bar .busy q::before, .bar .busy q::after { content: none; }
-@media (prefers-color-scheme: dark) { .bar .busy b { color: #d29922; } }
-.bar .newer { display: none; color: #1f6feb; font-weight: 600; }
-.bar .newer.on { display: inline-block; }
-.bar { position: sticky; top: 0; z-index: 1; background: var(--bar); border-bottom: 1px solid var(--line);
-       font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", sans-serif; }
-.bar-in { max-width: 960px; margin: 0 auto; padding: 8px 24px; box-sizing: border-box;
-          display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.bar button { font: inherit; color: var(--fg); background: var(--btn); border: 1px solid var(--line);
-              border-radius: 6px; padding: 5px 12px; cursor: pointer; }
-.bar button:hover:not(:disabled) { background: var(--btn-hover); }
-.bar button:disabled { opacity: .45; cursor: default; }
-.bar button.danger { color: var(--danger); }
-.bar .status { color: var(--muted); margin-left: auto; }
-.bar kbd { font: 12px ui-monospace, monospace; }
-@media (max-width: 600px) { .markdown-body { padding: 16px; } .bar-in { padding: 8px 16px; }
-                            .bar .status { margin-left: 0; width: 100%; } }
+@media (prefers-reduced-motion: reduce) { .running .dot { animation: none; } }
+.card { margin: 18px 0 0; padding: 11px 14px; border: 1px solid var(--line); border-radius: 8px;
+        background: var(--panel); display: grid; grid-template-columns: 8px 1fr; column-gap: 10px; align-items: baseline; }
+.card .dot { transform: translateY(-1px); }
+.card.note { color: var(--amber); }
+.card .sub { grid-column: 2; color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card .since { color: var(--muted); font-weight: 400; }
+#busy { display: none; } #busy.on { display: grid; }
+
+/* messages */
+.thread { margin-top: 36px; display: flex; flex-direction: column; gap: 28px; }
+.msg { display: grid; grid-template-columns: 32px minmax(0, 1fr); column-gap: 12px; }
+.avatar { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+          background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); }
+.avatar.claude { background: var(--accent-bg); color: var(--accent); border-color: transparent; }
+.avatar.peer { color: var(--blue); }
+.avatar.pic { border-color: var(--line); background: var(--panel-2); overflow: hidden; }
+.avatar.pic img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.msg-head { display: flex; align-items: center; gap: 8px; min-height: 32px;
+            font-size: 13px; color: var(--muted); }
+.msg-head b { color: var(--fg); font-weight: 600; }
+.msg-body { grid-column: 2; min-width: 0; margin-top: 6px; }
+.msg-body > .markdown-body { margin: 0 !important; padding: 0 !important; max-width: none !important; }
+.followups { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.followup-head { font-size: 12.5px; color: var(--muted); margin: 0 0 4px; display: flex; gap: 6px; align-items: center; }
+.bubble { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px;
+          color: var(--fg-2); font-size: 14px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+details.bubble { padding: 0; }
+details.bubble > summary { list-style: none; cursor: pointer; padding: 10px 14px; display: flex; gap: 10px;
+                           align-items: baseline; color: var(--fg-2); white-space: normal; }
+details.bubble > summary::-webkit-details-marker { display: none; }
+details.bubble > summary .first { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+details.bubble > summary .more { flex: none; font-size: 12px; color: var(--faint); }
+details.bubble[open] > summary { display: none; }
+details.bubble > .full { padding: 10px 14px; }
+.said-only { font-size: 13px; color: var(--amber); margin: 0 0 8px; }
+
+/* markdown, tuned */
+.markdown-body { font-family: var(--sans) !important; font-size: 15px !important; line-height: 1.7 !important;
+  background: transparent !important; color: var(--fg) !important;
+  --fgColor-default: var(--fg); --fgColor-muted: var(--muted); --fgColor-accent: var(--accent);
+  --bgColor-default: transparent; --bgColor-muted: var(--panel); --bgColor-neutral-muted: var(--panel-2);
+  --borderColor-default: var(--line); --borderColor-muted: var(--line); --fontStack-monospace: var(--mono); }
+.markdown-body > :first-child { margin-top: 0 !important; }
+.markdown-body h1, .markdown-body h2 { border-bottom: 0 !important; padding-bottom: 0 !important; letter-spacing: -.01em; }
+.markdown-body h1 { font-size: 1.35em !important; } .markdown-body h2 { font-size: 1.2em !important; }
+.markdown-body h3 { font-size: 1.05em !important; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3 { margin-top: 1.6em !important; font-weight: 600 !important; }
+.markdown-body p, .markdown-body ul, .markdown-body ol, .markdown-body table, .markdown-body pre,
+.markdown-body blockquote { margin-bottom: 14px !important; }
+.markdown-body li + li { margin-top: .3em; }
+.markdown-body strong { font-weight: 600; color: var(--fg); }
+.markdown-body a { color: var(--accent) !important; }
+.markdown-body code { font-size: 85% !important; border-radius: 4px !important; background: var(--panel-2) !important;
+                      padding: .15em .4em !important; }
+.markdown-body pre { position: relative; background: var(--panel) !important; border: 1px solid var(--line);
+                     border-radius: 8px !important; padding: 14px 16px !important; font-size: 13px !important; line-height: 1.55 !important; }
+.markdown-body pre code { background: none !important; padding: 0 !important; font-size: 100% !important; }
+.markdown-body pre .hljs { background: none !important; padding: 0 !important; }
+.markdown-body blockquote { color: var(--muted) !important; border-left: 3px solid var(--line-2) !important; padding: 0 1em !important; }
+.markdown-body table { display: table !important; width: auto; border-collapse: collapse; font-size: 14px; }
+.markdown-body table tr { background: transparent !important; border-top: 1px solid var(--line) !important; }
+.markdown-body table th, .markdown-body table td { border: 1px solid var(--line) !important; padding: 6px 12px !important; }
+.markdown-body table th { background: var(--panel); font-weight: 600; }
+.markdown-body hr { background: var(--line) !important; height: 1px !important; }
+.copy { position: absolute; top: 8px; right: 8px; height: 24px; padding: 0 8px; font-size: 12px; opacity: 0; transition: opacity .15s; }
+.markdown-body pre:hover .copy, .copy:focus { opacity: 1; }
+
+/* files */
+.section { margin-top: 40px; }
+.section-head { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; font-size: 13px; color: var(--muted); }
+.section-head h2 { font-size: 13px; font-weight: 600; color: var(--fg-2); margin: 0; }
+.section-head .grow { flex: 1; }
+.files { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.file { display: flex; align-items: center; gap: 9px; padding: 7px 12px; font: 12.5px/1.4 var(--mono); color: var(--fg); }
+.file + .file { border-top: 1px solid var(--line); }
+.file svg { color: var(--faint); }
+.file .dir { color: var(--faint); }
+
+/* earlier turns */
+.timeline { list-style: none; margin: 0; padding: 0; position: relative; }
+.timeline:has(> li:only-child)::before { display: none; }
+.timeline::before { content: ""; position: absolute; left: 12px; top: 14px; bottom: 14px; width: 1px; background: var(--line); }
+.turn { display: grid; grid-template-columns: 26px minmax(0, 1fr); column-gap: 10px; position: relative; }
+.turn .num { width: 25px; height: 25px; margin-top: 6px; border-radius: 50%; display: grid; place-items: center;
+             font-size: 11px; font-weight: 500; color: var(--muted); background: var(--bg); border: 1px solid var(--line-2); z-index: 1; }
+.turn details { min-width: 0; }
+.turn summary { list-style: none; cursor: pointer; padding: 6px 10px; border-radius: 6px; }
+.turn summary::-webkit-details-marker { display: none; }
+.turn summary:hover { background: var(--panel); }
+.turn summary .q { display: block; font-weight: 500; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.turn summary .who { color: var(--blue); font-weight: 500; }
+.turn summary .r { display: block; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.turn details[open] summary .r { display: none; }
+.turn .turn-body { padding: 6px 10px 22px; display: flex; flex-direction: column; gap: 14px; }
+.turn .markdown-body { font-size: 14.5px !important; }
+.hidden-turns { margin: 6px 0 0 36px; font-size: 13px; color: var(--faint); }
+
+@media (max-width: 640px) {
+  .page { padding: 28px 16px 80px; } .top-in { padding: 0 10px 0 14px; }
+  .crumbs .cur, .crumbs .sep, .toast { display: none; } .actions .label { display: none; }
+  h1.title { font-size: 22px; }
+}
 """
 
-RENDER_JS = """
-const src = JSON.parse(document.getElementById('src').textContent);
+ICONS = {
+    "spark": '<path d="M8 1.5v3M8 11.5v3M1.5 8h3M11.5 8h3M3.4 3.4l2 2M10.6 10.6l2 2M12.6 3.4l-2 2M5.4 10.6l-2 2"/>',
+    "user": '<circle cx="8" cy="5.5" r="2.5"/><path d="M3 13.5c.8-2.4 2.7-3.5 5-3.5s4.2 1.1 5 3.5"/>',
+    "bot": '<rect x="3" y="5" width="10" height="8" rx="2"/><path d="M8 2.5V5M6 9h.01M10 9h.01"/>',
+    "term": '<rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6.5 6.5 8.5 4.5 10.5M8.5 10.5h3"/>',
+    "folder": '<path d="M1.5 4.5a1 1 0 0 1 1-1h3.2l1.6 1.6h6.2a1 1 0 0 1 1 1v6.4a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z"/>',
+    "branch": '<circle cx="4.5" cy="3.5" r="1.5"/><circle cx="4.5" cy="12.5" r="1.5"/><circle cx="11.5" cy="5.5" r="1.5"/><path d="M4.5 5v6M11.5 7c0 2.5-2 3-7 4"/>',
+    "clock": '<circle cx="8" cy="8" r="6.5"/><path d="M8 4.5V8l2.2 1.4"/>',
+    "hash": '<path d="M3 6h10.5M2.5 10H13M6.5 2.5 5.5 13.5M10.5 2.5l-1 11"/>',
+    "turns": '<path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h7"/>',
+    "file": '<path d="M4 1.5h5l3.5 3.5v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-11.5a1 1 0 0 1 1-1z"/><path d="M9 1.5V5h3.5"/>',
+    "go": '<path d="M6 3.5h-2.5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V10M9 2.5h4.5V7M13.5 2.5 7 9"/>',
+    "check": '<path d="m3 8.5 3 3 7-7"/>',
+    "x": '<path d="m4 4 8 8M12 4l-8 8"/>',
+    "reload": '<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/>',
+    "copy": '<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/>',
+    "expand": '<path d="m4.5 6 3.5 3.5L11.5 6"/>',
+}
+
+
+def svg(name):
+    return f'<svg class="i" viewBox="0 0 16 16" aria-hidden="true">{ICONS[name]}</svg>'
+
+
+# Built by the page script from the JSON blobs; the server only sends this skeleton.
+MAIN_HTML = """<main class="page">
+<h1 class="title" id="title"></h1>
+<div class="props" id="props"></div>
+<div class="card running" id="busy"><span class="dot"></span><b id="busy-head"></b><span class="sub" id="busy-prompt"></span></div>
+<div id="notes"></div>
+<div class="thread" id="thread"></div>
+<div id="files"></div>
+<div id="earlier"></div>
+</main>"""
+
+
+def top_html(served, title):
+    actions = ""
+    if served:
+        actions = (
+            '<span class="toast" id="status"></span><div class="actions">'
+            f'<button id="newer" class="primary" title="Claude replied again since this page was loaded">{svg("reload")}<span>New reply · Reload</span></button>'
+            f'<button id="focus" title="Show the pane in tmux and raise its Konsole window">{svg("go")}<span class="label">Go to pane</span></button>'
+            f'<button id="read">{svg("check")}<span class="label">Mark read</span></button>'
+            f'<button id="kill" class="danger" title="Kill the Claude session and close its tmux pane">{svg("x")}<span class="label">Kill session</span></button>'
+            "</div>")
+    return (f'<header class="top"><div class="top-in"><div class="crumbs"><span class="app">{svg("spark")}Reports</span>'
+            f'<span class="sep">/</span><span class="cur">{html.escape(title)}</span></div>{actions}</div></header>')
+
+
+RENDER_JS = r"""
+const J = (id) => { const e = document.getElementById(id); return e ? JSON.parse(e.textContent) : null; };
+const META = J('meta'), PAGE = J('page'), SRC = J('src'), TURNS = J('turns') || [], ICONS = J('icons');
+const AVATARS = J('avatars') || {};
+function avatar(kind, iconName) {  // your picture from the config folder, else an icon
+  const a = el('div', 'avatar ' + kind);
+  if (AVATARS[kind]) {
+    const img = el('img');
+    img.src = AVATARS[kind];
+    img.alt = '';
+    a.classList.add('pic');
+    a.append(img);
+  } else a.append(icon(iconName));
+  return a;
+}
 const md = window.markdownit({ html: false, linkify: true, highlight: (str, lang) => {
   if (window.hljs && lang && hljs.getLanguage(lang)) {
     try { return hljs.highlight(str, { language: lang }).value; } catch (_) {}
   }
   return '';
 }});
-const article = document.querySelector('.markdown-body');
-article.innerHTML = md.render(src);
-// Prompts collapsed to their first line: pasted logs or documents can be pages long.
-function collapsed(q) {
-  const text = q.textContent.trim();
-  const first = text.split('\\n')[0].replace(/\\s+/g, ' ').trim();
-  if (first === text && first.length <= 160) return q;  // nothing hidden, nothing to expand
-  const d = document.createElement('details');
-  d.className = 'asked';
-  const sum = document.createElement('summary');
-  sum.textContent = first.length > 160 ? first.slice(0, 159) + '…' : first;
-  const more = document.createElement('span');
-  more.className = 'n';
-  more.textContent = text.length.toLocaleString() + ' characters';
-  sum.append(more);
-  d.append(sum, q);
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function icon(name) {  // the markup is ours (ICONS), never transcript text
+  const t = document.createElement('template');
+  t.innerHTML = '<svg class="i" viewBox="0 0 16 16" aria-hidden="true">' + ICONS[name] + '</svg>';
+  return t.content.firstChild;
+}
+function ago(t) {
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.round(s / 60) + ' min ago';
+  if (s < 86400) return Math.round(s / 3600) + ' h ago';
+  return Math.round(s / 86400) + ' d ago';
+}
+const oneLine = (t) => t.replace(/\s+/g, ' ').trim();
+// Markdown from the transcript, through markdown-it with html: false: shown, never run.
+function markdown(text, cls) {
+  const d = el('div', 'markdown-body' + (cls ? ' ' + cls : ''));
+  d.innerHTML = md.render(text);
+  for (const pre of d.querySelectorAll('pre')) {
+    const b = el('button', 'copy');
+    b.append(icon('copy'), 'Copy');
+    b.onclick = async () => {
+      try { await navigator.clipboard.writeText(pre.querySelector('code')?.textContent ?? pre.textContent);
+            b.lastChild.textContent = 'Copied'; } catch (_) { b.lastChild.textContent = 'Select it'; }
+      setTimeout(() => { b.lastChild.textContent = 'Copy'; }, 1500);
+    };
+    pre.append(b);
+  }
   return d;
 }
-for (const h of article.querySelectorAll('h2')) {
-  const q = h.nextElementSibling;
-  if (h.textContent !== 'Asked' || !q || q.tagName !== 'BLOCKQUOTE') continue;
-  const marker = document.createComment('');
-  q.replaceWith(marker);
-  marker.replaceWith(collapsed(q));
-  break;
+// A prompt as plain text, collapsed to its first line when there is more.
+function bubble(text) {
+  text = text.trim();
+  const first = oneLine(text.split('\n')[0]);
+  if (first === text && first.length <= 160) return el('div', 'bubble', text);
+  const d = el('details', 'bubble');
+  const s = el('summary');
+  s.append(el('span', 'first', first), el('span', 'more', text.length.toLocaleString() + ' characters · expand'));
+  d.append(s, el('div', 'full', text));
+  return d;
 }
-// Earlier turns, collapsed. Prompts go in as text, replies through markdown-it (html: false).
-const turnsEl = document.getElementById('turns');
-const turns = turnsEl ? JSON.parse(turnsEl.textContent) : [];
-if (turns.length) {
-  const h = document.createElement('h2');
-  h.textContent = 'Earlier in this session';
-  article.appendChild(h);
-  for (const t of turns) {
-    const d = document.createElement('details');
-    d.className = 'turn';
-    const sum = document.createElement('summary');
-    const n = document.createElement('span');
-    n.className = 'n';
-    n.textContent = t.n + '.';
-    const one = t.prompt.split('\\n\\n↳ ')[0].replace(/\\s+/g, ' ').trim();
-    sum.append(n, one.length > 140 ? one.slice(0, 139) + '…' : one);
-    const q = document.createElement('blockquote');
-    q.textContent = t.prompt;
-    const r = document.createElement('div');
-    r.innerHTML = t.reply ? md.render(t.reply) : '<p><em>(no reply)</em></p>';
-    d.append(sum, collapsed(q), r);
-    article.appendChild(d);
+// "Message from session X:" marks a prompt another Claude session sent.
+function who(text) {
+  const m = /^Message from session (.+?):\n\n/.exec(text);
+  return m ? { name: m[1], peer: true, text: text.slice(m[0].length) } : { name: 'You', peer: false, text };
+}
+// The prompt, then what arrived while Claude worked on it (queued by you or sent by a session).
+function prompt(text) {
+  const [main, ...later] = text.split('\n\n↳ ');
+  const w = who(main);
+  const m = el('div', 'msg');
+  const av = w.peer ? avatar('peer', 'bot') : avatar('you', 'user');
+  const head = el('div', 'msg-head');
+  head.append(el('b', '', w.name), w.peer ? 'sent a message' : 'asked');
+  const body = el('div', 'msg-body');
+  body.append(bubble(w.text));
+  if (later.length) {
+    const f = el('div', 'followups');
+    for (const part of later) {
+      const i = part.indexOf(':\n\n');
+      const box = el('div');
+      box.append(el('div', 'followup-head', i > 0 ? '↳ ' + part.slice(0, i) : '↳'),
+                 bubble(i > 0 ? part.slice(i + 3) : part));
+      f.append(box);
+    }
+    body.append(f);
   }
+  m.append(av, head, body);
+  return m;
+}
+function reply(text, saidOnly) {
+  const m = el('div', 'msg');
+  const av = avatar('claude', 'spark');
+  const head = el('div', 'msg-head');
+  head.append(el('b', '', 'Claude'), 'replied');
+  const body = el('div', 'msg-body');
+  if (saidOnly) body.append(el('p', 'said-only', 'Last thing Claude wrote before the session ended:'));
+  body.append(text ? markdown(text) : el('p', 'said-only', '(no reply)'));
+  m.append(av, head, body);
+  return m;
+}
+function prop(iconName, text, cls, title) {
+  const p = el('span', 'prop' + (cls ? ' ' + cls : ''));
+  if (iconName) p.append(icon(iconName));
+  p.append(text);
+  if (title) p.title = title;
+  return p;
+}
+document.getElementById('title').textContent = META.title;
+
+// Live state (from the server's /api/state): status badge and the "working" card.
+let LIVE = null;
+function setLive(s) {
+  LIVE = s;
+  const props = document.getElementById('props');
+  props.replaceChildren();
+  if (s) {
+    const st = s.busy === 'waiting' ? ['waiting', 'Waiting for you']
+             : s.busy === 'running' ? ['running', 'Working']
+             : s.open ? ['open', 'Open'] : ['', 'Closed'];
+    const p = el('span', 'prop status ' + st[0]);
+    p.append(el('i', 'dot'), el('span', '', st[1]));
+    props.append(p);
+    if (s.unread) props.append(prop(null, 'Unread', 'unread'));
+  }
+  const target = (s && s.target) || META.tmux;
+  if (target) props.append(prop('term', target, 'mono', s && s.open ? 'tmux pane' : 'tmux pane (last known)'));
+  if (META.folder) props.append(prop('folder', META.folder, 'mono'));
+  if (META.branch) props.append(prop('branch', META.branch, 'mono'));
+  props.append(prop('clock', ago(META.ended), '', 'Finished ' + new Date(META.ended * 1000).toLocaleString()));
+  props.append(prop('turns', 'Turn ' + META.turn, '', META.session ? 'Session running for ' + META.session : ''));
+  const id = el('button', 'prop mono', null);
+  id.append(icon('hash'), META.id.slice(0, 8));
+  id.title = 'Copy the session id ' + META.id;
+  id.onclick = async () => { try { await navigator.clipboard.writeText(META.id); id.lastChild.textContent = 'copied'; } catch (_) {}
+                             setTimeout(() => { id.lastChild.textContent = META.id.slice(0, 8); }, 1500); };
+  props.append(id);
+
+  const busy = document.getElementById('busy');
+  busy.classList.toggle('on', !!(s && s.busy));
+  if (s && s.busy) {
+    busy.className = 'card on ' + s.busy;
+    const since = s.since ? ' · since ' + new Date(s.since * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    const head = document.getElementById('busy-head');
+    head.replaceChildren(s.busy === 'waiting' ? 'Waiting for you in the pane (permission prompt or question)'
+                         : s.prompt ? 'Working on a new message' : 'Working again', el('span', 'since', since));
+    document.getElementById('busy-prompt').textContent = s.prompt ? oneLine(s.prompt) : '';
+    document.getElementById('busy-prompt').title = s.prompt || '';
+  }
+}
+setLive(null);
+
+const notes = document.getElementById('notes');
+function note(text) {
+  const c = el('div', 'card note');
+  c.append(el('span', 'dot'), el('b', '', text));
+  notes.append(c);
+}
+if (META.unfinished) note('Unfinished: the session ended before Claude finished its reply.');
+if (META.background) note('Still working: ' + META.background + ' background task' + (META.background > 1 ? 's' : '') +
+                          ' running; Claude may continue and update this report.');
+
+const thread = document.getElementById('thread');
+if (PAGE) {
+  if (PAGE.asked) thread.append(prompt(PAGE.asked));
+  thread.append(reply(PAGE.report, PAGE.said_only));
+} else {
+  // A report from before the page data was kept: its markdown, without the title and table.
+  thread.append(markdown(SRC.replace(/^# .*\n+(?:>.*\n+)*(?:\|.*\n)+\n*/, '')));
+}
+
+if (PAGE && META.files.length) {
+  const sec = el('section', 'section');
+  const h = el('div', 'section-head');
+  h.append(el('h2', '', 'Files changed'), String(META.files.length));
+  const list = el('div', 'files');
+  for (const f of META.files) {
+    const row = el('div', 'file');
+    const cut = f.lastIndexOf('/') + 1;
+    const path = el('span');
+    path.append(el('span', 'dir', f.slice(0, cut)), f.slice(cut));
+    row.append(icon('file'), path);
+    list.append(row);
+  }
+  sec.append(h, list);
+  document.getElementById('files').append(sec);
+}
+
+if (TURNS.length) {
+  const sec = el('section', 'section');
+  const h = el('div', 'section-head');
+  const all = el('button', 'ghost', 'Expand all');
+  h.append(el('h2', '', 'Earlier in this session'), String(TURNS.length), el('span', 'grow'), all);
+  const ol = el('ol', 'timeline');
+  for (const t of TURNS) {
+    const li = el('li', 'turn');
+    const d = el('details');
+    const s = el('summary');
+    const w = who(t.prompt.split('\n\n↳ ')[0]);
+    const q = el('span', 'q');
+    if (w.peer) q.append(el('span', 'who', w.name + ': '));
+    q.append(oneLine(w.text));
+    s.append(q, el('span', 'r', t.reply ? oneLine(t.reply.replace(/```[\s\S]*?```/g, ' ').replace(/^[ \t]*(?:#+|>|[-*+]|\d+\.)[ \t]+/gm, '').replace(/\*\*|`/g, '')).slice(0, 240) : '(no reply)'));
+    const body = el('div', 'turn-body');
+    d.append(s, body);
+    // Rendered on first open: 20 turns of markdown are cheap, but there's no need up front.
+    d.addEventListener('toggle', () => {
+      if (d.open && !body.firstChild) body.append(prompt(t.prompt), reply(t.reply));
+    });
+    li.append(el('span', 'num', String(t.n)), d);
+    ol.append(li);
+  }
+  all.onclick = () => {
+    const open = all.textContent === 'Expand all';
+    for (const d of ol.querySelectorAll(':scope > li > details')) d.open = open;
+    all.textContent = open ? 'Collapse all' : 'Expand all';
+  };
+  sec.append(h, ol);
+  const hidden = META.turn - 1 - TURNS.length;
+  if (hidden > 0) sec.append(el('p', 'hidden-turns', hidden + ' older turn' + (hidden > 1 ? 's' : '') + ' not shown'));
+  document.getElementById('earlier').append(sec);
 }
 """
 
-BAR_HTML = """<div class="bar"><div class="bar-in">
-<button id="focus" title="Show the pane in tmux and raise its Konsole window">Go to pane</button>
-<button id="read">Mark read</button>
-<button id="kill" class="danger" title="Kill the Claude session and close its tmux pane">Kill session</button>
-<button id="newer" class="newer" title="Claude replied again since this page was loaded">New reply · Reload</button>
-<span class="status" id="status"></span></div>
-<div class="busy" id="busy"><b id="busy-head"></b> <span id="busy-since"></span><q id="busy-prompt"></q></div></div>"""
-
-BAR_JS = """
+BAR_JS = r"""
 const ID = %s, TOKEN = %s, VERSION = %s;
 const $ = (id) => document.getElementById(id);
-let state = null;
+let state = null, toastTimer = null;
+function toast(text) {
+  $('status').textContent = text;
+  $('status').classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $('status').classList.remove('on'), 5000);
+}
 function show(s, note) {
   state = s;
   $('newer').classList.toggle('on', s.version > VERSION);
-  $('focus').textContent = s.open ? 'Go to pane' : 'Resume session';
+  $('focus').lastChild.textContent = s.open ? 'Go to pane' : 'Resume session';
   $('focus').title = s.open ? 'Show the pane in tmux and raise its Konsole window'
                             : 'The session is closed: resume it in a new tmux window';
-  $('read').textContent = s.unread ? 'Mark read' : 'Mark unread';
+  $('read').lastChild.textContent = s.unread ? 'Mark read' : 'Mark unread';
   $('kill').disabled = !s.open;
-  // What the session is doing since this report: from claude-tasks, as text only.
-  $('busy').classList.toggle('on', !!s.busy);
-  $('busy').classList.toggle('waiting', s.busy === 'waiting');
-  $('busy-head').textContent = s.busy === 'waiting'
-    ? 'Waiting for you in the pane (permission prompt or question)'
-    : s.prompt ? 'Working on your new message' : 'Working again';
-  $('busy-since').textContent = s.since
-    ? '· since ' + new Date(s.since * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-  $('busy-prompt').textContent = s.prompt || '';
-  $('busy-prompt').title = s.prompt || '';
-  $('status').textContent = note || (s.open ? 'Open in ' + s.target : 'Session closed') +
-                                    (s.unread ? ' · unread' : '');
+  if (window.setLive) setLive(s);
+  if (note) toast(note);
 }
 async function call(method, path) {
   try {
     const r = await fetch(path, { method, headers: { 'X-Claude-Reports': TOKEN } });
     const body = await r.json();
     if (body.state) show(body.state, r.ok ? body.message : 'Error: ' + body.message);
-    else $('status').textContent = r.status === 404 ? 'This report was deleted'
-                                                    : 'Error: ' + (body.message || r.status);
+    else toast(r.status === 404 ? 'This report was deleted' : 'Error: ' + (body.message || r.status));
     return body.state;
   } catch (e) {
-    $('status').textContent = 'claude-reports server is not running (reopen from the popup)';
+    toast('claude-reports server is not running (reopen from the popup)');
   }
 }
 const refresh = () => call('GET', '/api/state/' + ID);
@@ -1025,7 +1387,7 @@ $('newer').onclick = () => location.reload();
 $('focus').onclick = () => call('POST', '/api/focus/' + ID);
 $('read').onclick = () => call('POST', '/api/' + (state && !state.unread ? 'unread' : 'read') + '/' + ID);
 $('kill').onclick = () => {
-  if (confirm('Kill this Claude session and close its tmux pane (' + state.target + ')?\\n\\nThe report stays.'))
+  if (confirm('Kill this Claude session and close its tmux pane (' + state.target + ')?\n\nThe report stays.'))
     call('POST', '/api/kill/' + ID);
 };
 // Check for a newer reply when you come back to the tab, and every 5 s while it's visible.
@@ -1035,22 +1397,54 @@ setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 50
 refresh().then((s) => { if (s && s.unread) call('POST', '/api/read/' + ID); });
 """
 
+# Without markdown-it (the python-markdown or plain-text fallback): the old simple page.
+FALLBACK_CSS = """
+body { margin: 0; background: var(--bg); color: var(--fg); }
+.markdown-body { box-sizing: border-box; max-width: 860px; margin: 0 auto; padding: 32px 24px 64px; }
+"""
+
 
 def page_title(meta):
     # Unique, so a window manager script can find the browser window showing it.
     return f"{meta.get('title', 'Report')} · claude-report {meta['id'][:8]}"
 
 
-def render(meta, md, token=None, nonce=None, turns=None):
-    """A report page. With a token it is served by `claude-reports serve`: assets come from
-    /assets/ and the page gets the button bar. Without, it is a standalone file:// page.
+def view_of(meta):
+    """The metadata the page shows, ready to display."""
+    start, end = local(meta.get("started")), datetime.fromtimestamp(meta.get("ended", 0)).astimezone()
+    return {"id": meta["id"], "title": meta.get("title", "Report"), "tmux": meta.get("tmux", ""),
+            "folder": home(meta.get("cwd") or ""), "branch": meta.get("branch", ""),
+            "ended": meta.get("ended", 0), "turn": meta.get("prompts", 0),
+            "session": duration(start, end) if start else "", "files": meta.get("files") or [],
+            "unfinished": bool(meta.get("unfinished")), "background": meta.get("background", 0)}
 
-    markdown-it (from live-preview.nvim, so it looks like <leader>mp) when its files are there;
-    else python-markdown; else preformatted text."""
+
+def page_files(sid):
+    """(earlier turns, page data) the hook saved next to the markdown; None for older reports."""
+    out = []
+    for name in (f"{sid}.turns.json", f"{sid}.page.json"):
+        try:
+            out.append(json.loads((STATE / name).read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            out.append(None)
+    return out
+
+
+def render(meta, md, token=None, nonce=None, turns=None, page=None):
+    """A report page. With a token it is served by `claude-reports serve`: assets come from
+    /assets/ and the page gets the buttons. Without, it is a standalone file:// page.
+
+    markdown-it (from live-preview.nvim) when its files are there: the page script lays out
+    the prompt, reply, files and earlier turns from the JSON it is given. Else python-markdown;
+    else preformatted text."""
     served = token is not None
 
     def asset(rel):
         return f"/assets/{rel}" if served else (ASSETS / rel).as_uri()
+
+    def blob(id_, value):
+        return (f'<script type="application/json" id="{id_}">'
+                f'{json.dumps(value, ensure_ascii=False).replace("</", "<" + chr(92) + "/")}</script>')
 
     n = f' nonce="{nonce}"' if nonce else ""
     head = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -1058,22 +1452,20 @@ def render(meta, md, token=None, nonce=None, turns=None):
             f'<title>{html.escape(page_title(meta))}</title>')
     if (ASSETS / "markdown/github-markdown.min.css").is_file():
         head += f'<link rel="stylesheet" href="{asset("markdown/github-markdown.min.css")}">'
-    head += f"<style{n}>{PAGE_CSS}</style>"
-    body = BAR_HTML if served else ""
     if (ASSETS / "markdown/markdown-it.min.js").is_file():
+        head += f"<style{n}>{PAGE_CSS}</style>"
         if (ASSETS / "highlight/highlight.min.js").is_file():
             head += (f'<link rel="stylesheet" href="{asset("highlight/main.css")}">'
                      f'<script src="{asset("highlight/highlight.min.js")}"></script>')
-        if turns and f"\n{EARLIER}\n" in md:
-            md = md.split(f"\n{EARLIER}\n", 1)[0]  # shown collapsed from the turns instead
-        data = json.dumps(md).replace("</", "<\\/")
-        body += (f'<article class="markdown-body"></article>'
-                 f'<script type="application/json" id="src">{data}</script>'
-                 f'<script type="application/json" id="turns">'
-                 f'{json.dumps(turns or []).replace("</", "<" + chr(92) + "/")}</script>'
-                 f'<script src="{asset("markdown/markdown-it.min.js")}"></script>'
+        if turns is not None and f"\n{EARLIER}\n" in md:
+            md = md.split(f"\n{EARLIER}\n", 1)[0]  # shown from the turns instead
+        body = top_html(served, meta.get("title", "Report")) + MAIN_HTML
+        body += (blob("src", md) + blob("turns", turns or []) + blob("meta", view_of(meta))
+                 + blob("page", page) + blob("icons", ICONS) + blob("avatars", avatars())
+                 + f'<script src="{asset("markdown/markdown-it.min.js")}"></script>'
                  f'<script{n}>{RENDER_JS}</script>')
     else:
+        head += f"<style{n}>{PAGE_CSS.split('/* top bar */')[0]}{FALLBACK_CSS}</style>"
         try:
             import markdown
             conv = markdown.Markdown(extensions=["extra", "sane_lists"])
@@ -1083,6 +1475,7 @@ def render(meta, md, token=None, nonce=None, turns=None):
             inner = conv.convert(md)
         except ImportError:
             inner = f"<pre>{html.escape(md)}</pre>"
+        body = (top_html(served, meta.get("title", "Report")) if served else "")
         body += f'<article class="markdown-body">{inner}</article>'
     if served:
         js = BAR_JS % (json.dumps(meta["id"]), json.dumps(token), json.dumps(meta.get("ended", 0)))
@@ -1185,11 +1578,8 @@ def make_handler(port, secret, touch):
                 csp = (f"default-src 'none'; script-src 'self' 'nonce-{nonce}'; "
                        f"style-src 'self' 'nonce-{nonce}'; font-src 'self'; img-src 'self' data:; "
                        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-                try:
-                    turns = json.loads((STATE / f"{sid}.turns.json").read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    turns = None  # reports from before turns were kept: the markdown has them
-                return self.send(200, render(meta, md, secret, nonce, turns), "text/html",
+                turns, page = page_files(sid)  # None for older reports: the markdown has it all
+                return self.send(200, render(meta, md, secret, nonce, turns, page), "text/html",
                                  [("Content-Security-Policy", csp)])
             if m := re.fullmatch(r"/api/state/([A-Za-z0-9-]+)", url.path):
                 if not (self.cookie_ok() and self.header_token_ok()):
@@ -1288,7 +1678,7 @@ def open_report(sid):
         page = STATE / "html" / f"{sid}.html"
         page.parent.mkdir(parents=True, exist_ok=True)
         md = (STATE / f"{sid}.md").read_text(encoding="utf-8")
-        write_atomic(page, render(meta, md))
+        write_atomic(page, render(meta, md, None, None, *page_files(sid)))
         url = page.as_uri()
         set_unread(meta, False)  # no page script to do it
         refresh_status()

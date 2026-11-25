@@ -27,7 +27,12 @@ can stay open or not: when you are done with it, `/exit` frees its RAM and the r
   tmux pane title, else your first prompt.
 - **Picker** (`fzf`, vim keys) with a rendered preview (`bat`). Unread reports are marked `●`,
   unfinished ones `!`. If Claude still has background tasks running, the report says so.
-- **Enter opens the report in the browser**, with three buttons at the top:
+- **Enter opens the report in the browser** as a page built for reading: the title with the
+  session's status, tmux pane, folder, branch and age as small labels, then your prompt and
+  Claude's reply as a conversation, the files changed, and the earlier turns as a timeline
+  (all of them, one line each, click to expand, or "Expand all"). Long prompts are collapsed to their
+  first line, and code blocks get a copy button. It follows the system's light or dark
+  theme. Three buttons sit in the top bar:
   - **Go to pane** switches tmux to the session's pane and raises the Konsole window (and tab)
     that shows it. If the session is closed, the button becomes **Resume session**.
   - **Mark read / unread.** Opening a report marks it read; "Mark unread" keeps it as a
@@ -49,8 +54,8 @@ can stay open or not: when you are done with it, `/exit` frees its RAM and the r
   no buttons.
 - **Rendering:** if
   [live-preview.nvim](https://github.com/brianhuster/live-preview.nvim) is installed, its
-  markdown-it, highlight.js and GitHub CSS are used, so reports look like that plugin's
-  preview. Otherwise python-markdown is used. Raw HTML in a transcript is shown as text, never
+  markdown-it and highlight.js render the replies (the page uses its own styling on top of
+  the plugin's GitHub CSS). Otherwise python-markdown renders a plain page. Raw HTML in a transcript is shown as text, never
   run.
 - **`c` goes to the session.** It goes through
   [tmux-claude-sessions](https://github.com/dodokr/tmux-claude-sessions) when installed, which
@@ -78,7 +83,9 @@ can stay open or not: when you are done with it, `/exit` frees its RAM and the r
 - Python ≥ 3.11 (standard library; python-markdown is used only as a fallback renderer)
 - A recent [fzf](https://github.com/junegunn/fzf) (uses `--gutter`, `--with-shell`)
 - tmux ≥ 3.3 for the popup
-- Optional: `bat` for the preview, live-preview.nvim for the nicer HTML rendering
+- Optional: `bat` for the preview, live-preview.nvim for the HTML page (without it you get a
+  plain one), and the [Inter](https://rsms.me/inter/) font (`pacman -S inter-font`), which the
+  page uses when installed; it falls back to your system's sans-serif
 - For the buttons: systemd (user instance) for socket activation, tmux-claude-tasks (to know
   which pane runs which session), and KDE Plasma 6 with Konsole for raising the window (`qdbus6`).
   Without KDE, "Go to pane" still switches tmux; it just can't raise the terminal.
@@ -160,7 +167,12 @@ and no others. It makes no network requests. If you change the port, change it i
 | `CLAUDE_REPORTS_ASSETS` | live-preview.nvim's `static/` (lazy.nvim path) | markdown-it assets |
 | `CLAUDE_REPORTS_PORT` | `47823` | server port (keep it in sync with the `.socket` file) |
 | `CLAUDE_REPORTS_IDLE` | `1800` | seconds without requests before the server exits |
+| `CLAUDE_REPORTS_CONFIG` | `$XDG_CONFIG_HOME/claude-reports` | where avatar pictures are |
 | `CLAUDE_REPORTS_RESUME` | `$CLAUDE_SESSIONS_RESUME`, else `claude --resume {id}` | used without claude-sessions |
+
+**Avatars:** put `avatar-you.jpg` and `avatar-claude.jpg` (or `.png`, `.webp`, `.gif`, up to
+256 KB; about 96×96 px is plenty) in `~/.config/claude-reports/` to show them next to your
+prompts and Claude's replies instead of the icons. They are embedded in the page.
 
 The page title is unique (`<title> · claude-report <id>`), so a `CLAUDE_REPORTS_FOCUS` script can
 find the exact browser window showing the report and raise it.

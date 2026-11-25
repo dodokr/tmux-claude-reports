@@ -322,9 +322,10 @@ class Build(Env):
             records += [prompt(f"q{i}"), tool("Bash", command="x"), result(), say(f"answer {i}")]
         s = self.parsed(records + [prompt("last")])
         turns = cr.earlier_turns(s)
-        self.assertEqual(len(turns), cr.MAX_TURNS)
+        self.assertEqual(len(turns), 25)  # the page gets them all
         self.assertEqual(turns[0], {"n": 25, "prompt": "q25", "reply": "answer 25"})
-        self.assertEqual(turns[-1]["n"], 6)
+        self.assertEqual(turns[-1]["n"], 1)
+        # the markdown (terminal preview) only the newest MD_TURNS
         md = cr.build(SID, s, {}, 0)[1]
         self.assertIn("### 25. q25\n\nanswer 25", md)
         self.assertIn("*5 older prompts not shown*", md)
@@ -640,6 +641,22 @@ class Server(Env):
         self.assertEqual(turns, [{"n": 1, "prompt": "first q", "reply": "first a"}])
         self.assertIn(f"VERSION = {self.meta()['ended']}", body)
         self.assertIn("call('POST', '/api/read/' + ID)", body)  # opening marks it read
+
+    def test_page_gets_the_prompt_and_reply_as_data(self):
+        self.with_markdown_it()
+        self.hook([prompt("first q"), say("first a"), prompt("second q"),
+                   tool("Edit", file_path="/home/u/proj/src/a.py"), result(), say("second a")])
+        page = json.loads((self.state / f"{SID}.page.json").read_text())
+        self.assertEqual(page, {"asked": "second q", "report": "second a", "said_only": False})
+        body = self.req("GET", f"/r/{SID}", {"Cookie": self.cookie})[2]
+        blob = lambda name: json.loads(body.split(f'id="{name}">')[1].split("</script>")[0]
+                                       .replace("<\\/", "</"))
+        self.assertEqual(blob("page"), page)
+        view = blob("meta")
+        self.assertEqual((view["folder"], view["turn"], view["files"]), ("/home/u/proj", 2, ["src/a.py"]))
+        self.assertIn("Kill session", body)
+        self.run_cr("delete", SID)
+        self.assertFalse((self.state / f"{SID}.page.json").exists())
 
     def test_old_reports_without_turns_file_keep_their_markdown(self):
         self.with_markdown_it()
